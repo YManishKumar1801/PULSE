@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+youtube_data.json
+reddit_data.json
+sentiment_results.json
+.env
+*.log
+.DS_Store

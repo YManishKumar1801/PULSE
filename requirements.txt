@@ -1,0 +1,11 @@
+streamlit
+google-api-python-client
+vaderSentiment
+transformers
+torch
+sentencepiece
+pymongo
+kafka-python
+requests
+Authlib
+python-dotenv
