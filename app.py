@@ -274,6 +274,10 @@ def get_bert():
     return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
 
 @st.cache_resource
+def get_multilingual_sentiment():
+    return pipeline("sentiment-analysis", model="cardiffnlp/twitter-xlm-roberta-base-sentiment")
+
+@st.cache_resource
 def get_emotion_classifier():
     return pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base")
 
@@ -304,6 +308,7 @@ with st.spinner("Loading models... (first run takes longer)"):
     youtube = get_youtube_client()
     vader_analyzer = get_vader()
     bert_classifier = get_bert()
+    xlm_classifier = get_multilingual_sentiment()
     emotion_classifier = get_emotion_classifier()
     sarcasm_classifier = get_sarcasm_classifier()
     sentiment_collection = get_mongo_collection()
@@ -425,8 +430,8 @@ def clean_text(text):
     text = html.unescape(text)
     text = re.sub(r"http\S+|www\S+", "", text)
     text = re.sub(r"<.*?>", "", text)
-    text = re.sub(r"[^\x00-\x7F]+", " ", text)
-    text = re.sub(r"[^a-zA-Z0-9\s.,!?']", "", text)
+    text = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF]", "", text)
+    text = re.sub(r"[^a-zA-Z0-9\u0900-\u097F\s.,!?']", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -446,13 +451,32 @@ def get_bert_sentiment(text):
     result = bert_classifier(text[:512])[0]
     label = "Positive" if result["label"] == "POSITIVE" else "Negative"
     score = result["score"]
-    if score < 0.75:  # raised from 0.65 — fewer low-confidence comments get labeled Positive/Negative
+    if score < 0.75:
         label = "Neutral"
     return label, round(score, 3)
 
 
-def ensemble_sentiment(v_label, b_label):
-    return v_label if v_label == b_label else b_label
+def get_xlm_sentiment(text):
+    if not text or len(text.strip()) == 0:
+        return "Neutral", 0.0
+    try:
+        result = xlm_classifier(text[:512])[0]
+        label_map = {"positive": "Positive", "neutral": "Neutral", "negative": "Negative"}
+        label = label_map.get(result["label"].lower(), "Neutral")
+        return label, round(result["score"], 3)
+    except Exception:
+        return "Neutral", 0.0
+
+
+def ensemble_sentiment(v_label, b_label, x_label):
+    votes = [v_label, b_label, x_label]
+    counts = {}
+    for v in votes:
+        counts[v] = counts.get(v, 0) + 1
+    best_label = max(counts, key=counts.get)
+    if counts[best_label] >= 2:
+        return best_label
+    return x_label
 
 
 def is_sarcastic(text):
@@ -607,10 +631,18 @@ def analyze_keyword(keyword):
             cleaned = clean_text(c["text"])
             v_label, v_score = get_vader_sentiment(cleaned)
             b_label, b_score = get_bert_sentiment(cleaned)
-            final = ensemble_sentiment(v_label, b_label)
+            x_label, x_score = get_xlm_sentiment(cleaned)
+            final = ensemble_sentiment(v_label, b_label, x_label)
             counts[final] += 1
             platform_counts[platform] = platform_counts.get(platform, 0) + 1
-            confidence = abs(v_score) if final == v_label else b_score
+            matching_scores = []
+            if v_label == final:
+                matching_scores.append(abs(v_score))
+            if b_label == final:
+                matching_scores.append(b_score)
+            if x_label == final:
+                matching_scores.append(x_score)
+            confidence = max(matching_scores) if matching_scores else 0.5
             all_comments.append({
                 "text": cleaned, "sentiment": final, "video_title": item["title"],
                 "platform": platform, "confidence": confidence
