@@ -1,0 +1,155 @@
+<html>
+    <head>
+        <meta charset="utf-8">
+        
+            <script src="lib/bindings/utils.js"></script>
+            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/dist/vis-network.min.css" integrity="sha512-WgxfT5LWjfszlPHXRmBWHkV2eceiWTOBvrKCNbdgDYTHrT2AeLCGbF4sZlZw3UMN3WtL0tGUoIAKsu8mllg/XA==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/vis-network.min.js" integrity="sha512-LnvoEWDFrqGHlHmDD2101OrLcbsfkrzoSpvtSQtxK3RMnRV0eOkhhBN2dXHKRrUU8p2DGRTk35n4O8nWSVe1mQ==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+            
+        
+<center>
+<h1></h1>
+</center>
+
+<!-- <link rel="stylesheet" href="../node_modules/vis/dist/vis.min.css" type="text/css" />
+<script type="text/javascript" src="../node_modules/vis/dist/vis.js"> </script>-->
+        <link
+          href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta3/dist/css/bootstrap.min.css"
+          rel="stylesheet"
+          integrity="sha384-eOJMYsd53ii+scO/bJGFsiCZc+5NDVN2yr8+0RDqr0Ql0h+rP48ckxlpbzKgwra6"
+          crossorigin="anonymous"
+        />
+        <script
+          src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta3/dist/js/bootstrap.bundle.min.js"
+          integrity="sha384-JEW9xMcG8R+pH31jmWH6WWP0WintQrMb4s7ZOdauHnUtxwoG2vI5DkLtS3qm9Ekf"
+          crossorigin="anonymous"
+        ></script>
+
+
+        <center>
+          <h1></h1>
+        </center>
+        <style type="text/css">
+
+             #mynetwork {
+                 width: 100%;
+                 height: 600px;
+                 background-color: #FAF9F6;
+                 border: 1px solid lightgray;
+                 position: relative;
+                 float: left;
+             }
+
+             
+
+             
+
+             
+        </style>
+    </head>
+
+
+    <body>
+        <div class="card" style="width: 100%">
+            
+            
+            <div id="mynetwork" class="card-body"></div>
+        </div>
+
+        
+        
+
+        <script type="text/javascript">
+
+              // initialize global variables.
+              var edges;
+              var nodes;
+              var allNodes;
+              var allEdges;
+              var nodeColors;
+              var originalNodes;
+              var network;
+              var container;
+              var options, data;
+              var filter = {
+                  item : '',
+                  property : '',
+                  value : []
+              };
+
+              
+
+              
+
+              // This method is responsible for drawing the graph, returns the drawn network
+              function drawGraph() {
+                  var container = document.getElementById('mynetwork');
+
+                  
+
+                  // parsing and collecting nodes and edges from the python
+                  nodes = new vis.DataSet([{"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::telegram", "label": "Telegram News", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::news2", "label": "\u0627\u062e\u0628\u0627\u0631 \u0631\u0648\u0632 \u0627\u0642\u062a\u0635\u0627\u062f\u064a", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "label": "\ud835\udc05\ud835\udc0e\ud835\udc0e\ud835\udc13\ud835\udc01\ud835\udc00\ud835\udc0b\ud835\udc0b \ud835\udc01\ud835\udc04\ud835\udc13\ud835\udc13\ud835\udc08\ud835\udc0d\ud835\udc06 \ud835\udc13\ud835\udc08\ud835\udc0f\ud835\udc12", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1003842114545", "label": "User -1003842114545", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8796954860", "label": "User 8796954860", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::1695307614", "label": "User 1695307614", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8164147150", "label": "User 8164147150", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::6719468048", "label": "User 6719468048", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::7522294875", "label": "User 7522294875", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8903564695", "label": "User 8903564695", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8490433882", "label": "User 8490433882", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8655237392", "label": "User 8655237392", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::6400110138", "label": "User 6400110138", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8918876934", "label": "User 8918876934", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8836816236", "label": "User 8836816236", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8779162679", "label": "User 8779162679", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::6553808228", "label": "User 6553808228", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8998101243", "label": "User 8998101243", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::7566311785", "label": "User 7566311785", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::5548115920", "label": "User 5548115920", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::SPORTS_PREDICTIONS_BETTING_TIPS", "label": "\ud835\udc05\ud835\udc0e\ud835\udc0e\ud835\udc13\ud835\udc01\ud835\udc00\ud835\udc0b\ud835\udc0b \ud835\udc0f\ud835\udc11\ud835\udc04\ud835\udc03\ud835\udc08\ud835\udc02\ud835\udc13\ud835\udc08\ud835\udc0e\ud835\udc0d\ud835\udc12", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1003983224436", "label": "User -1003983224436", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::Dream11F_winaddac_sportsc", "label": "\ud83d\ude80\ud83d\ude80OKWIN LUCKYJET\ud83d\ude80\ud83d\ude80", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1001464549846", "label": "User -1001464549846", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::BETINDI_BETMASTER", "label": "SATTAKING \ud83c\udf81 ANDARBAHAR \ud83c\uddee\ud83c\uddf3 SPORTSBOOK", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1002603387691", "label": "User -1002603387691", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::DIAMOND247_CRICGURU", "label": "CRICWIN \ud83d\ude80 SKYFAIR \ud83d\udc8e SPORTSADDA", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1002865795079", "label": "User -1002865795079", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::football_Soccerus", "label": "sports\ud83c\udf81 betting\ud83c\udf81 predictions", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1003803913493", "label": "User -1003803913493", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::sportstarweb", "label": "Sportstar", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::6764041274", "label": "User 6764041274", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1001198965469", "label": "User -1001198965469", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::1140498604", "label": "User 1140498604", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::927114643", "label": "User 927114643", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::Sportsm", "label": "\u2764\ufe0f\u2764\ufe0f", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1001542466885", "label": "User -1001542466885", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::sportsc", "label": "\u0627\u0633\u067e\u0631\u062a \u0627\u0633\u0643\u0648\u0644\u0627\u0631", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::Crypto_Prediction_Cricket_Malik", "label": "Crypto Malik Mumbai\ud83c\udfcf", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::cricketbuzz_Allpanell01", "label": "\ud835\udddf\ud835\udde2\ud835\udde7\ud835\udde8\ud835\udde6\ud835\udfef\ud835\udff2\ud835\udff1 \ud835\uddd5\ud835\udde2\ud835\udde2\ud835\uddde", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::crypto_crickett_anurag0", "label": "MALIK MUMBAI crypto\ud83c\udfcf\ud83c\udfcf\ud83c\udfcf\ud83c\udfcf", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::cryptocryptozz", "label": "CRICKETBUZZ ALLPANEL LOTUS365 FAIRPLAY", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::Toss_Match_ETPL", "label": "CRICKET PREDICTION", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::MATCH_CRICKET_TOSS", "label": "TOSS MATCH PREDICTION", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::ETPL_cricket_Match", "label": "ETPL PREDICTION SESSION", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::bbcnewsburmese", "label": "BBC News \u1019\u103c\u1014\u103a\u1019\u102c", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1002217939425", "label": "User -1002217939425", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::BBCNewsChannel", "label": "BBC News (UK)", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1001390316128", "label": "User -1001390316128", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::BBCNews_Hindi", "label": "BBC Hindi | \u092c\u0940\u092c\u0940\u0938\u0940 \u0939\u093f\u0902\u0926\u0940", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1001267809068", "label": "User -1001267809068", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::BBCNews_Breaking", "label": "BBC Breaking News", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1001509340075", "label": "User -1001509340075", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::BBCNewsIndia8", "label": "BBC News India", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8193237547", "label": "User 8193237547", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8912517293", "label": "User 8912517293", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8817439461", "label": "User 8817439461", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8936630002", "label": "User 8936630002", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8356049792", "label": "User 8356049792", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8808751729", "label": "User 8808751729", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8902871843", "label": "User 8902871843", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8851395968", "label": "User 8851395968", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8887729489", "label": "User 8887729489", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8981183480", "label": "User 8981183480", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8782307690", "label": "User 8782307690", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8856453241", "label": "User 8856453241", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8806703331", "label": "User 8806703331", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8889052590", "label": "User 8889052590", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8870036338", "label": "User 8870036338", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8985901850", "label": "User 8985901850", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8781332156", "label": "User 8781332156", "shape": "dot", "size": 12}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::8794521326", "label": "User 8794521326", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::bbcnewsirl", "label": "BBC NEWS", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1003854442109", "label": "User -1003854442109", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::BBCnewsOfficialUK", "label": "News UK", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1001704501615", "label": "User -1001704501615", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::bbcnewsj", "label": "BBC news world", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1002052936006", "label": "User -1002052936006", "shape": "dot", "size": 12}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::crypto_cricket6_anurag", "label": "MALIK MUMBAI crypto\ud83c\udfcf\ud83c\udfcf\ud83c\udfcf\ud83c\udfcf", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::AE_TechNews", "label": "AE_TechNews", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::technewshub", "label": "Tech News hub", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::technews_mbi", "label": "Tech Mathrubhumi Updates", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::TechNewsLK", "label": "TechNews.LK", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::technewsmalayalam0", "label": "Tech News Malayalam", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::technewsG", "label": "TNG", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::TechNewsU", "label": "Global Tech News", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::technewsq", "label": "Sub4Sub 1k Subscribe", "shape": "dot", "size": 25}, {"color": "#639922", "font": {"color": "#2C2C2A"}, "id": "channel::bbcnews_england", "label": "BBC News England RSS", "shape": "dot", "size": 25}, {"color": "#3B8AD9", "font": {"color": "#2C2C2A"}, "id": "user::-1001460622974", "label": "User -1001460622974", "shape": "dot", "size": 12}]);
+                  edges = new vis.DataSet([{"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::-1003842114545", "value": 14}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::8796954860", "value": 1}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::1695307614", "value": 4}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::8164147150", "value": 4}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::6719468048", "value": 3}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::7522294875", "value": 1}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::8903564695", "value": 2}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::8490433882", "value": 1}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::8655237392", "value": 1}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::6400110138", "value": 2}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::8918876934", "value": 7}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::8836816236", "value": 2}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::8779162679", "value": 1}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::6553808228", "value": 1}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::8998101243", "value": 3}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::7566311785", "value": 2}, {"from": "channel::FOOTBALL_PREDICTIONS_SPORTS_TIPS", "to": "user::5548115920", "value": 1}, {"from": "channel::SPORTS_PREDICTIONS_BETTING_TIPS", "to": "user::-1003983224436", "value": 50}, {"from": "channel::Dream11F_winaddac_sportsc", "to": "user::-1001464549846", "value": 27}, {"from": "channel::BETINDI_BETMASTER", "to": "user::-1002603387691", "value": 50}, {"from": "channel::DIAMOND247_CRICGURU", "to": "user::-1002865795079", "value": 50}, {"from": "channel::football_Soccerus", "to": "user::-1003803913493", "value": 50}, {"from": "channel::sportstarweb", "to": "user::6764041274", "value": 4}, {"from": "channel::sportstarweb", "to": "user::-1001198965469", "value": 22}, {"from": "channel::sportstarweb", "to": "user::1140498604", "value": 8}, {"from": "channel::sportstarweb", "to": "user::927114643", "value": 10}, {"from": "channel::Sportsm", "to": "user::-1001542466885", "value": 39}, {"from": "channel::bbcnewsburmese", "to": "user::-1002217939425", "value": 22}, {"from": "channel::BBCNewsChannel", "to": "user::-1001390316128", "value": 50}, {"from": "channel::BBCNews_Hindi", "to": "user::-1001267809068", "value": 50}, {"from": "channel::BBCNews_Breaking", "to": "user::-1001509340075", "value": 50}, {"from": "channel::BBCNewsIndia8", "to": "user::8193237547", "value": 4}, {"from": "channel::BBCNewsIndia8", "to": "user::8912517293", "value": 2}, {"from": "channel::BBCNewsIndia8", "to": "user::8817439461", "value": 3}, {"from": "channel::BBCNewsIndia8", "to": "user::8936630002", "value": 3}, {"from": "channel::BBCNewsIndia8", "to": "user::8356049792", "value": 3}, {"from": "channel::BBCNewsIndia8", "to": "user::8808751729", "value": 3}, {"from": "channel::BBCNewsIndia8", "to": "user::8902871843", "value": 2}, {"from": "channel::BBCNewsIndia8", "to": "user::8851395968", "value": 3}, {"from": "channel::BBCNewsIndia8", "to": "user::8887729489", "value": 4}, {"from": "channel::BBCNewsIndia8", "to": "user::8981183480", "value": 3}, {"from": "channel::BBCNewsIndia8", "to": "user::8782307690", "value": 3}, {"from": "channel::BBCNewsIndia8", "to": "user::8856453241", "value": 3}, {"from": "channel::BBCNewsIndia8", "to": "user::8806703331", "value": 4}, {"from": "channel::BBCNewsIndia8", "to": "user::8889052590", "value": 2}, {"from": "channel::BBCNewsIndia8", "to": "user::8870036338", "value": 3}, {"from": "channel::BBCNewsIndia8", "to": "user::8985901850", "value": 2}, {"from": "channel::BBCNewsIndia8", "to": "user::8781332156", "value": 2}, {"from": "channel::BBCNewsIndia8", "to": "user::8794521326", "value": 1}, {"from": "channel::bbcnewsirl", "to": "user::-1003854442109", "value": 50}, {"from": "channel::BBCnewsOfficialUK", "to": "user::-1001704501615", "value": 50}, {"from": "channel::bbcnewsj", "to": "user::-1002052936006", "value": 4}, {"from": "channel::bbcnews_england", "to": "user::-1001460622974", "value": 50}]);
+
+                  nodeColors = {};
+                  allNodes = nodes.get({ returnType: "Object" });
+                  for (nodeId in allNodes) {
+                    nodeColors[nodeId] = allNodes[nodeId].color;
+                  }
+                  allEdges = edges.get({ returnType: "Object" });
+                  // adding nodes and edges to the graph
+                  data = {nodes: nodes, edges: edges};
+
+                  var options = {
+    "configure": {
+        "enabled": false
+    },
+    "edges": {
+        "color": {
+            "inherit": true
+        },
+        "smooth": {
+            "enabled": true,
+            "type": "dynamic"
+        }
+    },
+    "interaction": {
+        "dragNodes": true,
+        "hideEdgesOnDrag": false,
+        "hideNodesOnDrag": false
+    },
+    "physics": {
+        "enabled": true,
+        "stabilization": {
+            "enabled": true,
+            "fit": true,
+            "iterations": 1000,
+            "onlyDynamicEdges": false,
+            "updateInterval": 50
+        }
+    }
+};
+
+                  
+
+
+                  
+
+                  network = new vis.Network(container, data, options);
+
+                  
+
+                  
+
+                  
+
+
+                  
+
+                  return network;
+
+              }
+              drawGraph();
+        </script>
+    </body>
+</html>

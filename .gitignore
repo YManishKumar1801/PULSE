@@ -8,3 +8,8 @@ sentiment_results.json
 .env
 *.log
 .DS_Store
+*.session
+*.session-journal
+youtube_data.json
+sentiment_results.json
+telegram_data.json

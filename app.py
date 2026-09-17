@@ -4,7 +4,13 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import pipeline
 from pymongo import MongoClient
 from kafka import KafkaProducer, KafkaConsumer
-from datetime import datetime, timezone
+from telethon.sync import TelegramClient
+from telethon.tl.functions.contacts import SearchRequest
+import networkx as nx
+from pyvis.network import Network as PyvisNetwork
+from langdetect import detect, LangDetectException
+from collections import Counter
+from datetime import datetime, timezone, timedelta
 import re
 import html
 import requests
@@ -12,6 +18,7 @@ import json
 import uuid
 import math
 import os
+import asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,6 +27,8 @@ API_KEY = os.getenv("YOUTUBE_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 KAFKA_BROKER = "localhost:9092"
 KAFKA_TOPIC = "pulse-youtube"
 
@@ -266,6 +275,18 @@ def get_youtube_client():
     return build("youtube", "v3", developerKey=API_KEY)
 
 @st.cache_resource
+def get_telegram_loop():
+    return asyncio.new_event_loop()
+
+@st.cache_resource
+def get_telegram_client():
+    loop = get_telegram_loop()
+    asyncio.set_event_loop(loop)
+    client = TelegramClient("pulse_session", TELEGRAM_API_ID, TELEGRAM_API_HASH, loop=loop)
+    client.start()
+    return client
+
+@st.cache_resource
 def get_vader():
     return SentimentIntensityAnalyzer()
 
@@ -291,6 +312,17 @@ def get_mongo_collection():
     return client["pulse_db"]["sentiment_results"]
 
 @st.cache_resource
+def get_telegram_collection():
+    client = MongoClient(MONGO_URI)
+    return client["pulse_db"]["telegram_sentiment_results"]
+
+@st.cache_resource
+def get_demographics_collection():
+    client = MongoClient(MONGO_URI)
+    return client["pulse_db"]["demographics_results"]
+
+
+@st.cache_resource
 def get_kafka_producer():
     return KafkaProducer(
         bootstrap_servers=KAFKA_BROKER,
@@ -306,12 +338,15 @@ def get_summarizer():
 
 with st.spinner("Loading models... (first run takes longer)"):
     youtube = get_youtube_client()
+    telegram_client = get_telegram_client()
     vader_analyzer = get_vader()
     bert_classifier = get_bert()
     xlm_classifier = get_multilingual_sentiment()
     emotion_classifier = get_emotion_classifier()
     sarcasm_classifier = get_sarcasm_classifier()
     sentiment_collection = get_mongo_collection()
+    telegram_collection = get_telegram_collection()
+    demographics_collection = get_demographics_collection()
     kafka_producer = get_kafka_producer()
     summarizer_tokenizer, summarizer_model = get_summarizer()
 
@@ -595,6 +630,288 @@ def read_messages_from_kafka(request_id, expected_count, timeout_seconds=45):
     return messages
 
 
+def search_telegram_channels(keyword, max_results=5):
+    try:
+        asyncio.set_event_loop(get_telegram_loop())
+        result = telegram_client(SearchRequest(q=keyword, limit=max_results))
+        channels = []
+        for chat in result.chats:
+            username = getattr(chat, "username", None)
+            if username:
+                channels.append({"id": chat.id, "title": getattr(chat, "title", ""), "username": username})
+        return channels, None
+    except Exception as e:
+        return [], str(e)
+
+
+def fetch_channel_messages(username, limit=50):
+    messages = []
+    try:
+        asyncio.set_event_loop(get_telegram_loop())
+        entity = telegram_client.get_entity(username)
+        for message in telegram_client.iter_messages(entity, limit=limit):
+            if message.text:
+                messages.append({
+                    "text": message.text,
+                    "date": message.date,
+                    "sender_id": message.sender_id,
+                    "views": getattr(message, "views", None)
+                })
+    except Exception:
+        pass
+    return messages
+
+
+def analyze_telegram_keyword(keyword):
+    channels, search_error = search_telegram_channels(keyword)
+    if not channels:
+        return None, search_error
+
+    all_results = []
+    counts = {"Positive": 0, "Negative": 0, "Neutral": 0}
+
+    for ch in channels:
+        messages = fetch_channel_messages(ch["username"])
+        message_docs = []
+
+        for msg in messages:
+            cleaned = clean_text(msg["text"])
+            v_label, v_score = get_vader_sentiment(cleaned)
+            b_label, b_score = get_bert_sentiment(cleaned)
+            x_label, x_score = get_xlm_sentiment(cleaned)
+            final = ensemble_sentiment(v_label, b_label, x_label)
+
+            counts[final] += 1
+            message_docs.append({
+                "text": cleaned,
+                "sentiment": final,
+                "date": str(msg["date"]),
+                "sender_id": msg["sender_id"]
+            })
+
+        document = {
+            "channel_title": ch["title"],
+            "channel_username": ch["username"],
+            "keyword": keyword,
+            "platform": "Telegram",
+            "fetched_at": datetime.now(timezone.utc),
+            "messages": message_docs,
+            "total_messages": len(message_docs)
+        }
+
+        telegram_collection.update_one(
+            {"channel_username": ch["username"], "keyword": keyword},
+            {"$set": document},
+            upsert=True
+        )
+
+        all_results.append(document)
+
+    total = sum(len(r["messages"]) for r in all_results)
+    return {"channels": all_results, "counts": counts, "total": total}, None
+
+
+TREND_STOPWORDS = set("""
+a about above after again against all am an and any are aren't as at be because been
+before being below between both but by can't cannot could couldn't did didn't do does
+doesn't doing don't down during each few for from further had hadn't has hasn't have
+haven't having he he'd he'll he's her here here's hers herself him himself his how
+how's i i'd i'll i'm i've if in into is isn't it it's its itself let's me more most
+mustn't my myself no nor not of off on once only or other ought our ours ourselves out
+over own same shan't she she'd she'll she's should shouldn't so some such than that
+that's the their theirs them themselves then there there's these they they'd they'll
+they're they've this those through to too under until up very was wasn't we we'd we'll
+we're we've were weren't what what's when when's where where's which while who who's
+whom why why's with won't would wouldn't you you'd you'll you're you've your yours
+yourself yourselves is are was were video comment channel https http www com
+""".split())
+
+
+def extract_all_documents():
+    documents = []
+    for doc in sentiment_collection.find():
+        fetched_at = doc.get("fetched_at")
+        for c in doc.get("comments", []):
+            documents.append({
+                "text": c.get("cleaned_text") or c.get("original_text", ""),
+                "date": fetched_at,
+                "platform": doc.get("platform", "YouTube")
+            })
+    for doc in telegram_collection.find():
+        for m in doc.get("messages", []):
+            documents.append({
+                "text": m.get("text", ""),
+                "date": m.get("date"),
+                "platform": "Telegram"
+            })
+    return documents
+
+
+def tokenize_for_trends(text):
+    words = re.findall(r"[a-zA-Z\u0900-\u097F]{3,}", text.lower())
+    return [w for w in words if w not in TREND_STOPWORDS]
+
+
+def parse_trend_date(date_value):
+    if isinstance(date_value, datetime):
+        return date_value
+    if isinstance(date_value, str):
+        try:
+            return datetime.fromisoformat(date_value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    return None
+
+
+def detect_trends(documents, recent_hours=24, top_n=15):
+    now = datetime.now(timezone.utc)
+    recent_cutoff = now - timedelta(hours=recent_hours)
+    older_cutoff = recent_cutoff - timedelta(hours=recent_hours)
+
+    recent_counter = Counter()
+    older_counter = Counter()
+    overall_counter = Counter()
+
+    for doc in documents:
+        words = tokenize_for_trends(doc["text"])
+        overall_counter.update(words)
+
+        date = parse_trend_date(doc["date"])
+        if date is None:
+            continue
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+
+        if date >= recent_cutoff:
+            recent_counter.update(words)
+        elif date >= older_cutoff:
+            older_counter.update(words)
+
+    trending = []
+    for word, recent_count in recent_counter.items():
+        older_count = older_counter.get(word, 0)
+        growth = recent_count - older_count
+        trending.append((word, recent_count, older_count, growth))
+    trending.sort(key=lambda x: x[3], reverse=True)
+
+    return {
+        "most_mentioned_overall": overall_counter.most_common(top_n),
+        "trending_now": trending[:top_n]
+    }
+
+
+LANGUAGE_NAMES = {
+    "en": "English", "hi": "Hindi", "mr": "Marathi", "ta": "Tamil",
+    "te": "Telugu", "bn": "Bengali", "gu": "Gujarati", "kn": "Kannada",
+    "ml": "Malayalam", "pa": "Punjabi", "ur": "Urdu", "ne": "Nepali"
+}
+
+INTEREST_CATEGORIES = {
+    "Technology": ["tech", "phone", "app", "software", "ai", "computer", "internet", "gadget", "device", "code"],
+    "Sports": ["cricket", "match", "team", "player", "score", "goal", "tournament", "ipl", "football", "kohli"],
+    "Politics": ["government", "minister", "election", "party", "policy", "parliament", "vote", "modi", "gandhi"],
+    "Entertainment": ["movie", "film", "actor", "actress", "song", "music", "show", "trailer", "release", "bollywood"],
+    "Finance": ["price", "market", "stock", "money", "economy", "tax", "inflation", "budget", "rupee", "investment"],
+    "Automobile": ["car", "bike", "vehicle", "petrol", "diesel", "mileage", "engine", "fuel", "e20", "ethanol"]
+}
+
+
+def detect_language(text):
+    if not text or len(text.strip()) < 10:
+        return "unknown"
+    try:
+        code = detect(text)
+        return LANGUAGE_NAMES.get(code, code)
+    except LangDetectException:
+        return "unknown"
+
+
+def tag_interests(text):
+    text_lower = text.lower()
+    matched = []
+    for category, keywords in INTEREST_CATEGORIES.items():
+        if any(re.search(r"\b" + re.escape(kw) + r"\b", text_lower) for kw in keywords):
+            matched.append(category)
+    return matched
+
+
+def analyze_demographics(documents):
+    language_counter = Counter()
+    interest_counter = Counter()
+    platform_language = {}
+
+    for doc in documents:
+        text = doc["text"]
+        if not text:
+            continue
+        lang = detect_language(text)
+        language_counter[lang] += 1
+
+        platform = doc["platform"]
+        if platform not in platform_language:
+            platform_language[platform] = Counter()
+        platform_language[platform][lang] += 1
+
+        for category in tag_interests(text):
+            interest_counter[category] += 1
+
+    total = sum(language_counter.values())
+    language_distribution = {
+        lang: {"count": count, "percent": round(count / total * 100, 1)}
+        for lang, count in language_counter.most_common()
+    } if total > 0 else {}
+
+    return {
+        "language_distribution": language_distribution,
+        "interest_distribution": dict(interest_counter.most_common()),
+        "platform_language_breakdown": {p: dict(c.most_common()) for p, c in platform_language.items()},
+        "total_documents_analyzed": total
+    }
+
+
+def build_network_graph():
+    G = nx.Graph()
+    for doc in telegram_collection.find():
+        channel = doc.get("channel_username") or doc.get("channel_title")
+        if not channel:
+            continue
+        channel_node = f"channel::{channel}"
+        G.add_node(channel_node, type="channel", label=doc.get("channel_title", channel))
+        for m in doc.get("messages", []):
+            sender = m.get("sender_id")
+            if sender is None:
+                continue
+            sender_node = f"user::{sender}"
+            G.add_node(sender_node, type="user", label=f"User {sender}")
+            if G.has_edge(sender_node, channel_node):
+                G[sender_node][channel_node]["weight"] += 1
+            else:
+                G.add_edge(sender_node, channel_node, weight=1)
+    return G
+
+
+def compute_network_influence(G):
+    user_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "user"]
+    channel_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "channel"]
+    influence = {n: G.degree(n) for n in user_nodes}
+    reach = {n: G.degree(n) for n in channel_nodes}
+    top_users = sorted(influence.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_channels = sorted(reach.items(), key=lambda x: x[1], reverse=True)[:10]
+    return top_users, top_channels
+
+
+def generate_network_html(G, output_file="network_graph.html"):
+    net = PyvisNetwork(height="600px", width="100%", bgcolor="#FAF9F6", font_color="#2C2C2A")
+    for node, data in G.nodes(data=True):
+        color = "#639922" if data.get("type") == "channel" else "#3B8AD9"
+        size = 25 if data.get("type") == "channel" else 12
+        net.add_node(node, label=data.get("label", node), color=color, size=size)
+    for source, target, data in G.edges(data=True):
+        net.add_edge(source, target, value=data.get("weight", 1))
+    net.write_html(output_file)
+    return output_file
+
+
 def analyze_keyword(keyword):
     videos = search_videos_by_keyword(keyword)
     news_articles = fetch_news_by_keyword(keyword)
@@ -870,121 +1187,343 @@ with hcol2:
         st.rerun()
 
 
-if "keyword_input" not in st.session_state:
-    st.session_state["keyword_input"] = ""
+tab1, tab2 = st.tabs(["Live Sentiment (YouTube & News)", "Social Media Analytics (Telegram)"])
 
-if "pending_trending_keyword" in st.session_state:
-    st.session_state["keyword_input"] = st.session_state.pop("pending_trending_keyword")
-    st.session_state["trigger_analyze"] = True
+with tab1:
+    if "keyword_input" not in st.session_state:
+        st.session_state["keyword_input"] = ""
 
-col1, col2 = st.columns([4, 1])
-with col1:
-    keyword = st.text_input("Enter any topic or keyword", placeholder="e.g. Budget 2026, IPL, iPhone 17...", label_visibility="collapsed", key="keyword_input")
-with col2:
-    search_clicked = st.button("Analyze", use_container_width=True, type="primary")
+    if "pending_trending_keyword" in st.session_state:
+        st.session_state["keyword_input"] = st.session_state.pop("pending_trending_keyword")
+        st.session_state["trigger_analyze"] = True
 
-trending_topics = fetch_trending_topics()
-if trending_topics:
-    st.markdown("""
-    <div style="background:#fff;border-radius:14px;padding:20px 22px;border:0.5px solid #E5E2D9;box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-top:16px;">
-        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
-            <div style="width:40px;height:40px;border-radius:10px;background:#EAF3DE;display:flex;align-items:center;justify-content:center;font-size:18px;">🔥</div>
-            <div>
-                <div style="display:flex;align-items:center;gap:8px;">
-                    <span style="font-size:16px;font-weight:700;color:#2C2C2A;">Trending on YouTube</span>
-                    <span style="background:#EAF3DE;color:#3B6D11;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;letter-spacing:0.5px;">LIVE</span>
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        keyword = st.text_input("Enter any topic or keyword", placeholder="e.g. Budget 2026, IPL, iPhone 17...", label_visibility="collapsed", key="keyword_input")
+    with col2:
+        search_clicked = st.button("Analyze", use_container_width=True, type="primary")
+
+    trending_topics = fetch_trending_topics()
+    if trending_topics:
+        st.markdown("""
+        <div style="background:#fff;border-radius:14px;padding:20px 22px;border:0.5px solid #E5E2D9;box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-top:16px;">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+                <div style="width:40px;height:40px;border-radius:10px;background:#EAF3DE;display:flex;align-items:center;justify-content:center;font-size:18px;">🔥</div>
+                <div>
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <span style="font-size:16px;font-weight:700;color:#2C2C2A;">Trending on YouTube</span>
+                        <span style="background:#EAF3DE;color:#3B6D11;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;letter-spacing:0.5px;">LIVE</span>
+                    </div>
+                    <p style="color:#888780;font-size:12px;margin:2px 0 0 0;">What's hot and popular right now</p>
                 </div>
-                <p style="color:#888780;font-size:12px;margin:2px 0 0 0;">What's hot and popular right now</p>
             </div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
-    card_cols = st.columns(len(trending_topics))
-    for i, item in enumerate(trending_topics):
-        with card_cols[i]:
-            short_title = item["topic"] if len(item["topic"]) <= 20 else item["topic"][:18] + "..."
-            thumb = item["thumbnail"]
-            st.markdown(f"""
-            <div style="background:#fff;border:0.5px solid #E5E2D9;border-radius:10px;padding:10px;margin-top:8px;display:flex;align-items:center;gap:8px;">
-                <span style="background:#EAF3DE;color:#3B6D11;font-size:11px;font-weight:700;width:20px;height:20px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">{i+1}</span>
-                <img src="{thumb}" style="width:28px;height:28px;border-radius:50%;object-fit:cover;flex-shrink:0;">
-                <span style="font-size:12px;color:#2C2C2A;font-weight:500;line-height:1.3;">{short_title}</span>
-            </div>
-            """, unsafe_allow_html=True)
+        card_cols = st.columns(len(trending_topics))
+        for i, item in enumerate(trending_topics):
+            with card_cols[i]:
+                short_title = item["topic"] if len(item["topic"]) <= 20 else item["topic"][:18] + "..."
+                thumb = item["thumbnail"]
+                st.markdown(f"""
+                <div style="background:#fff;border:0.5px solid #E5E2D9;border-radius:10px;padding:10px;margin-top:8px;display:flex;align-items:center;gap:8px;">
+                    <span style="background:#EAF3DE;color:#3B6D11;font-size:11px;font-weight:700;width:20px;height:20px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">{i+1}</span>
+                    <img src="{thumb}" style="width:28px;height:28px;border-radius:50%;object-fit:cover;flex-shrink:0;">
+                    <span style="font-size:12px;color:#2C2C2A;font-weight:500;line-height:1.3;">{short_title}</span>
+                </div>
+                """, unsafe_allow_html=True)
 
-            if st.button("● Analyze this", key=f"trending_chip_{i}", use_container_width=True, type="secondary"):
-                st.session_state["pending_trending_keyword"] = item["topic"]
-                st.rerun()
+                if st.button("● Analyze this", key=f"trending_chip_{i}", use_container_width=True, type="secondary"):
+                    st.session_state["pending_trending_keyword"] = item["topic"]
+                    st.rerun()
 
-auto_triggered = st.session_state.pop("trigger_analyze", False)
+    auto_triggered = st.session_state.pop("trigger_analyze", False)
 
-if (search_clicked or auto_triggered) and not keyword.strip():
-    st.warning("Enter a keyword first, then click Analyze.")
+    if (search_clicked or auto_triggered) and not keyword.strip():
+        st.warning("Enter a keyword first, then click Analyze.")
 
-if (search_clicked or auto_triggered) and keyword.strip():
-    try:
-        with st.spinner(f"Fetching live YouTube data for '{keyword}'..."):
-            result = analyze_keyword(keyword.strip())
+    if (search_clicked or auto_triggered) and keyword.strip():
+        try:
+            with st.spinner(f"Fetching live YouTube data for '{keyword}'..."):
+                result = analyze_keyword(keyword.strip())
 
-        if result is None or result["total"] == 0:
-            st.warning("No videos or comments found for this topic. Try a more popular or recent keyword.")
-        else:
-            st.session_state["last_result"] = result
-            st.session_state.pop(f"reason_summaries_main_{result['keyword']}", None)
-            st.session_state.pop(f"emotions_main_{result['keyword']}", None)
+            if result is None or result["total"] == 0:
+                st.warning("No videos or comments found for this topic. Try a more popular or recent keyword.")
+            else:
+                st.session_state["last_result"] = result
+                st.session_state.pop(f"reason_summaries_main_{result['keyword']}", None)
+                st.session_state.pop(f"emotions_main_{result['keyword']}", None)
 
-    except PulseError as e:
-        st.error(str(e))
-    except Exception:
-        st.error("Something went wrong while analyzing this topic. Please try again in a moment.")
+        except PulseError as e:
+            st.error(str(e))
+        except Exception:
+            st.error("Something went wrong while analyzing this topic. Please try again in a moment.")
 
-st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
-
-compare_mode = st.checkbox("Compare two keywords instead")
-
-if compare_mode:
-    cc1, cc2, cc3 = st.columns([2, 2, 1])
-    with cc1:
-        keyword_a = st.text_input("Keyword A", placeholder="e.g. iPhone 17", label_visibility="collapsed")
-    with cc2:
-        keyword_b = st.text_input("Keyword B", placeholder="e.g. Samsung S26", label_visibility="collapsed")
-    with cc3:
-        compare_clicked = st.button("Compare", use_container_width=True, type="primary")
-
-    if compare_clicked:
-        if not keyword_a.strip() or not keyword_b.strip():
-            st.warning("Enter both keywords to compare.")
-        else:
-            try:
-                with st.spinner(f"Comparing '{keyword_a}' and '{keyword_b}'..."):
-                    result_a = analyze_keyword(keyword_a.strip())
-                    result_b = analyze_keyword(keyword_b.strip())
-
-                if (result_a is None or result_a["total"] == 0) or (result_b is None or result_b["total"] == 0):
-                    st.warning("Not enough data found for one or both keywords. Try different topics.")
-                else:
-                    st.session_state.pop(f"reason_summaries_a_{result_a['keyword']}", None)
-                    st.session_state.pop(f"emotions_a_{result_a['keyword']}", None)
-                    st.session_state.pop(f"reason_summaries_b_{result_b['keyword']}", None)
-                    st.session_state.pop(f"emotions_b_{result_b['keyword']}", None)
-                    st.session_state["compare_results"] = (result_a, result_b)
-
-            except PulseError as e:
-                st.error(str(e))
-            except Exception:
-                st.error("Something went wrong while comparing these topics. Please try again in a moment.")
-if "last_result" in st.session_state and not compare_mode:
-    render_result(st.session_state["last_result"], key_prefix="main")
-
-if compare_mode and "compare_results" in st.session_state:
-    result_a, result_b = st.session_state["compare_results"]
     st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
-    comp_col1, comp_col2 = st.columns(2)
-    with comp_col1:
-        render_result(result_a, key_prefix="a")
-    with comp_col2:
-        render_result(result_b, key_prefix="b")
 
-elif not compare_mode and "last_result" not in st.session_state:
-    st.info("Enter a keyword above and click Analyze to see live sentiment.")
+    compare_mode = st.checkbox("Compare two keywords instead")
+
+    if compare_mode:
+        cc1, cc2, cc3 = st.columns([2, 2, 1])
+        with cc1:
+            keyword_a = st.text_input("Keyword A", placeholder="e.g. iPhone 17", label_visibility="collapsed")
+        with cc2:
+            keyword_b = st.text_input("Keyword B", placeholder="e.g. Samsung S26", label_visibility="collapsed")
+        with cc3:
+            compare_clicked = st.button("Compare", use_container_width=True, type="primary")
+
+        if compare_clicked:
+            if not keyword_a.strip() or not keyword_b.strip():
+                st.warning("Enter both keywords to compare.")
+            else:
+                try:
+                    with st.spinner(f"Comparing '{keyword_a}' and '{keyword_b}'..."):
+                        result_a = analyze_keyword(keyword_a.strip())
+                        result_b = analyze_keyword(keyword_b.strip())
+
+                    if (result_a is None or result_a["total"] == 0) or (result_b is None or result_b["total"] == 0):
+                        st.warning("Not enough data found for one or both keywords. Try different topics.")
+                    else:
+                        st.session_state.pop(f"reason_summaries_a_{result_a['keyword']}", None)
+                        st.session_state.pop(f"emotions_a_{result_a['keyword']}", None)
+                        st.session_state.pop(f"reason_summaries_b_{result_b['keyword']}", None)
+                        st.session_state.pop(f"emotions_b_{result_b['keyword']}", None)
+                        st.session_state["compare_results"] = (result_a, result_b)
+
+                except PulseError as e:
+                    st.error(str(e))
+                except Exception:
+                    st.error("Something went wrong while comparing these topics. Please try again in a moment.")
+    if "last_result" in st.session_state and not compare_mode:
+        render_result(st.session_state["last_result"], key_prefix="main")
+
+    if compare_mode and "compare_results" in st.session_state:
+        result_a, result_b = st.session_state["compare_results"]
+        st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+        comp_col1, comp_col2 = st.columns(2)
+        with comp_col1:
+            render_result(result_a, key_prefix="a")
+        with comp_col2:
+            render_result(result_b, key_prefix="b")
+
+    elif not compare_mode and "last_result" not in st.session_state:
+        st.info("Enter a keyword above and click Analyze to see live sentiment.")
+
+with tab2:
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+    st.markdown("#### Search Telegram")
+    tg_col1, tg_col2 = st.columns([4, 1])
+    with tg_col1:
+        telegram_keyword = st.text_input("Search Telegram", placeholder="e.g. cricket, news, finance...", label_visibility="collapsed", key="telegram_keyword_input")
+    with tg_col2:
+        telegram_search_clicked = st.button("Analyze", use_container_width=True, type="primary", key="telegram_analyze_btn")
+
+    if telegram_search_clicked and telegram_keyword.strip():
+        with st.spinner(f"Searching Telegram for '{telegram_keyword}'..."):
+            telegram_result, telegram_error = analyze_telegram_keyword(telegram_keyword.strip())
+
+        if telegram_error:
+            st.error(f"Telegram search failed: {telegram_error}")
+        elif telegram_result is None or telegram_result["total"] == 0:
+            st.warning("No Telegram channels or messages found for this topic. Try a more common keyword.")
+        else:
+            st.session_state["telegram_last_result"] = telegram_result
+
+    if "telegram_last_result" in st.session_state:
+        tresult = st.session_state["telegram_last_result"]
+        tcounts = tresult["counts"]
+        ttotal = tresult["total"]
+
+        tpos = round(tcounts["Positive"] / ttotal * 100) if ttotal else 0
+        tneu = round(tcounts["Neutral"] / ttotal * 100) if ttotal else 0
+        tneg = round(tcounts["Negative"] / ttotal * 100) if ttotal else 0
+
+        t_radius = 58
+        t_circumference = 2 * 3.14159265 * t_radius
+
+        def t_donut_segment(percent, offset_percent):
+            length = t_circumference * percent / 100
+            dash = f"{length:.2f} {t_circumference - length:.2f}"
+            dashoffset = -(t_circumference * offset_percent / 100)
+            return dash, dashoffset
+
+        t_pos_dash, t_pos_offset = t_donut_segment(tpos, 0)
+        t_neu_dash, t_neu_offset = t_donut_segment(tneu, tpos)
+        t_neg_dash, t_neg_offset = t_donut_segment(tneg, tpos + tneu)
+
+        t_dominant_pct = max(tpos, tneu, tneg)
+        t_dominant_label = "positive" if tpos == t_dominant_pct else "negative" if tneg == t_dominant_pct else "neutral"
+        t_dominant_color = "#3B6D11" if t_dominant_label == "positive" else "#A32D2D" if t_dominant_label == "negative" else "#5F5E5A"
+
+        st.markdown(f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 12px 0;'>{ttotal} messages across {len(tresult['channels'])} channels</p>", unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div style="background:#fff;border-radius:14px;padding:22px;border:0.5px solid #E5E2D9;box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:16px;display:grid;grid-template-columns:180px 1fr;gap:24px;align-items:center;">
+            <div style="display:flex;justify-content:center;">
+                <svg width="140" height="140" viewBox="0 0 140 140">
+                    <circle cx="70" cy="70" r="{t_radius}" fill="none" stroke="#F0EEE8" stroke-width="16"/>
+                    <circle cx="70" cy="70" r="{t_radius}" fill="none" stroke="#639922" stroke-width="16" stroke-dasharray="{t_pos_dash}" stroke-dashoffset="{t_pos_offset}" transform="rotate(-90 70 70)"/>
+                    <circle cx="70" cy="70" r="{t_radius}" fill="none" stroke="#B4B2A9" stroke-width="16" stroke-dasharray="{t_neu_dash}" stroke-dashoffset="{t_neu_offset}" transform="rotate(-90 70 70)"/>
+                    <circle cx="70" cy="70" r="{t_radius}" fill="none" stroke="#E24B4A" stroke-width="16" stroke-dasharray="{t_neg_dash}" stroke-dashoffset="{t_neg_offset}" transform="rotate(-90 70 70)"/>
+                    <text x="70" y="65" text-anchor="middle" font-size="26" font-weight="700" fill="{t_dominant_color}">{t_dominant_pct}%</text>
+                    <text x="70" y="85" text-anchor="middle" font-size="11" fill="#5F5E5A">{t_dominant_label}</text>
+                </svg>
+            </div>
+            <div style="display:flex;flex-direction:column;justify-content:center;gap:10px;">
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <span style="width:10px;height:10px;border-radius:50%;background:#639922;"></span>
+                    <span style="color:#2C2C2A;font-size:14px;flex:1;">Positive</span>
+                    <span style="font-weight:700;color:#3B6D11;">{tpos}%</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <span style="width:10px;height:10px;border-radius:50%;background:#B4B2A9;"></span>
+                    <span style="color:#2C2C2A;font-size:14px;flex:1;">Neutral</span>
+                    <span style="font-weight:700;color:#5F5E5A;">{tneu}%</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <span style="width:10px;height:10px;border-radius:50%;background:#E24B4A;"></span>
+                    <span style="color:#2C2C2A;font-size:14px;flex:1;">Negative</span>
+                    <span style="font-weight:700;color:#A32D2D;">{tneg}%</span>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("Show channels and sample messages"):
+            for ch in tresult["channels"]:
+                st.markdown(f"**{ch['channel_title']}** (@{ch['channel_username']}) — {ch['total_messages']} messages")
+                for m in ch["messages"][:5]:
+                    color = "#3B6D11" if m["sentiment"] == "Positive" else "#A32D2D" if m["sentiment"] == "Negative" else "#5F5E5A"
+                    st.markdown(f"<span style='color:{color};font-weight:600;font-size:12px;'>{m['sentiment'].upper()}</span> {m['text'][:150]}", unsafe_allow_html=True)
+                st.markdown("---")
+
+    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+    st.markdown("#### Trend Detection")
+    st.caption("Analyzes all data collected so far across YouTube, News, and Telegram")
+
+    if st.button("Detect Trends", key="detect_trends_btn"):
+        with st.spinner("Analyzing trends across all collected data..."):
+            all_docs = extract_all_documents()
+            trend_results = detect_trends(all_docs)
+
+        if not all_docs:
+            st.warning("No data found yet. Run some searches first to collect data.")
+        else:
+            tr1, tr2 = st.columns(2)
+            with tr1:
+                st.markdown("**Most Mentioned (all-time)**")
+                mentions = trend_results["most_mentioned_overall"]
+                max_count = max([c for _, c in mentions], default=1)
+                for word, count in mentions:
+                    bar_pct = round(count / max_count * 100)
+                    st.markdown(
+                        f"<div style='margin-bottom:8px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
+                        f"<span style='color:#2C2C2A;'>{word}</span><span style='color:#5F5E5A;'>{count}</span></div>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='width:{bar_pct}%;background:#639922;height:100%;'></div></div></div>",
+                        unsafe_allow_html=True
+                    )
+            with tr2:
+                st.markdown("**Trending Now (last 24h growth)**")
+                trending = trend_results["trending_now"]
+                max_growth = max([max(g, 1) for _, _, _, g in trending], default=1)
+                for word, recent, older, growth in trending:
+                    bar_pct = round(max(growth, 0) / max_growth * 100)
+                    growth_color = "#639922" if growth >= 0 else "#A32D2D"
+                    st.markdown(
+                        f"<div style='margin-bottom:8px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
+                        f"<span style='color:#2C2C2A;'>{word}</span><span style='color:{growth_color};'>{growth:+d}</span></div>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='width:{bar_pct}%;background:{growth_color};height:100%;'></div></div></div>",
+                        unsafe_allow_html=True
+                    )
+
+    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+    st.markdown("#### Demographics (Aggregate, Anonymized)")
+    st.caption("Language and interest-category distribution across all collected data")
+
+    if st.button("Analyze Demographics", key="analyze_demo_btn"):
+        with st.spinner("Detecting languages and interest categories..."):
+            all_docs = extract_all_documents()
+            demo_results = analyze_demographics(all_docs)
+
+        if demo_results["total_documents_analyzed"] == 0:
+            st.warning("No data found yet. Run some searches first to collect data.")
+        else:
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                st.markdown("**Language Distribution**")
+                for lang, stats in demo_results["language_distribution"].items():
+                    st.markdown(
+                        f"<div style='margin-bottom:8px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
+                        f"<span style='color:#2C2C2A;'>{lang}</span><span style='color:#5F5E5A;'>{stats['percent']}%</span></div>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='width:{stats['percent']}%;background:#3B8AD9;height:100%;'></div></div></div>",
+                        unsafe_allow_html=True
+                    )
+            with dc2:
+                st.markdown("**Interest Categories**")
+                interests = demo_results["interest_distribution"]
+                max_mentions = max(interests.values(), default=1)
+                for category, count in interests.items():
+                    bar_pct = round(count / max_mentions * 100)
+                    st.markdown(
+                        f"<div style='margin-bottom:8px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
+                        f"<span style='color:#2C2C2A;'>{category}</span><span style='color:#5F5E5A;'>{count}</span></div>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='width:{bar_pct}%;background:#B15FC9;height:100%;'></div></div></div>",
+                        unsafe_allow_html=True
+                    )
+
+    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+    st.markdown("#### Link & Network Analysis")
+    st.caption("Based on Telegram data — maps users to the channels they post in")
+
+    if st.button("Build Network Graph", key="build_network_btn"):
+        with st.spinner("Building network graph..."):
+            G = build_network_graph()
+
+        if G.number_of_nodes() == 0:
+            st.warning("No Telegram data found yet. Search Telegram above first to collect data.")
+        else:
+            top_users, top_channels = compute_network_influence(G)
+
+            nc1, nc2 = st.columns(2)
+            with nc1:
+                st.markdown("**Top Influential Users**")
+                max_user_score = max([s for _, s in top_users], default=1)
+                for user, score in top_users:
+                    bar_pct = round(score / max_user_score * 100)
+                    st.markdown(
+                        f"<div style='margin-bottom:8px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
+                        f"<span style='color:#2C2C2A;'>{user}</span><span style='color:#5F5E5A;'>{score} channel(s)</span></div>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='width:{bar_pct}%;background:#639922;height:100%;'></div></div></div>",
+                        unsafe_allow_html=True
+                    )
+            with nc2:
+                st.markdown("**Top Channels by Reach**")
+                max_channel_score = max([s for _, s in top_channels], default=1)
+                for channel, score in top_channels:
+                    bar_pct = round(score / max_channel_score * 100)
+                    st.markdown(
+                        f"<div style='margin-bottom:8px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
+                        f"<span style='color:#2C2C2A;'>{channel}</span><span style='color:#5F5E5A;'>{score} user(s)</span></div>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='width:{bar_pct}%;background:#E24B4A;height:100%;'></div></div></div>",
+                        unsafe_allow_html=True
+                    )
+
+            st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+            st.markdown("**Interactive Network Graph** — drag nodes, scroll to zoom", unsafe_allow_html=True)
+            html_file = generate_network_html(G)
+            with open(html_file, "r", encoding="utf-8") as f:
+                graph_html = f.read()
+            st.components.v1.html(graph_html, height=620)
