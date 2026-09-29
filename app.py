@@ -27,6 +27,7 @@ API_KEY = os.getenv("YOUTUBE_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 KAFKA_BROKER = "localhost:9092"
@@ -329,13 +330,6 @@ def get_kafka_producer():
         value_serializer=lambda v: json.dumps(v).encode("utf-8")
     )
 
-@st.cache_resource
-def get_summarizer():
-    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-    tokenizer = AutoTokenizer.from_pretrained("csebuetnlp/mT5_multilingual_XLSum")
-    model = AutoModelForSeq2SeqLM.from_pretrained("csebuetnlp/mT5_multilingual_XLSum")
-    return tokenizer, model
-
 with st.spinner("Loading models... (first run takes longer)"):
     youtube = get_youtube_client()
     telegram_client = get_telegram_client()
@@ -348,7 +342,6 @@ with st.spinner("Loading models... (first run takes longer)"):
     telegram_collection = get_telegram_collection()
     demographics_collection = get_demographics_collection()
     kafka_producer = get_kafka_producer()
-    summarizer_tokenizer, summarizer_model = get_summarizer()
 
 
 
@@ -548,6 +541,53 @@ def compute_emotion_breakdown(comments, sample_size=40):
     return {label: round(count / total * 100) for label, count in sorted(emotion_counts.items(), key=lambda x: x[1], reverse=True)}
 
 
+def generate_gemini_summary(prompt):
+    """Generate a short reason summary using Gemini 3.5 Flash."""
+    if not GEMINI_API_KEY:
+        return None
+
+    try:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
+
+        response = requests.post(
+            url,
+            headers={
+                "x-goog-api-key": GEMINI_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt}
+                        ]
+                    }
+                ]
+            },
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            print("Gemini API Error:", response.status_code, response.text)
+            return None
+
+        data = response.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            print("Gemini returned no candidates:", data)
+            return None
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text_parts = [part.get("text", "") for part in parts if part.get("text")]
+        result = " ".join(text_parts).strip()
+
+        return result if result else None
+
+    except Exception as e:
+        print("Gemini Exception:", e)
+        return None
+
+
 def generate_reason_summary(comments, sentiment_label, keyword, max_input_comments=8):
     candidates = [
         c for c in comments
@@ -567,28 +607,16 @@ def generate_reason_summary(comments, sentiment_label, keyword, max_input_commen
     if len(combined.split()) < 8:
         return f"Not enough {sentiment_label.lower()} comments to summarize."
 
-    try:
-        input_ids = summarizer_tokenizer(
-            combined, return_tensors="pt", truncation=True, max_length=512
-        ).input_ids
-        output_ids = summarizer_model.generate(
-            input_ids,
-            max_length=70,
-            min_length=12,
-            num_beams=4,
-            length_penalty=1.2,
-            no_repeat_ngram_size=2
-        )
-        summary = summarizer_tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+    gemini_prompt = (
+        f"These are real comments about '{keyword}'. In one clear, complete sentence, "
+        f"explain the main reason people feel {sentiment_label.lower()} about it, "
+        f"based on this content: {combined}"
+    )
+    gemini_result = generate_gemini_summary(gemini_prompt)
+    if gemini_result:
+        return gemini_result.strip()
 
-        if summary and not summary.endswith((".", "!", "?", "।")):
-            last_punct = max(summary.rfind("."), summary.rfind("!"), summary.rfind("?"), summary.rfind("।"))
-            if last_punct > 15:
-                summary = summary[:last_punct + 1]
-
-        return summary.capitalize() if summary else f"Could not generate a summary for {sentiment_label.lower()} comments."
-    except Exception:
-        return f"Could not generate a summary for {sentiment_label.lower()} comments."
+    return f"Could not generate a summary for {sentiment_label.lower()} comments."
 
 
 def publish_to_kafka(request_id, keyword, item, comments, platform):
@@ -895,8 +923,10 @@ def compute_network_influence(G):
     channel_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "channel"]
     influence = {n: G.degree(n) for n in user_nodes}
     reach = {n: G.degree(n) for n in channel_nodes}
-    top_users = sorted(influence.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_channels = sorted(reach.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_users_raw = sorted(influence.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_channels_raw = sorted(reach.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_users = [(G.nodes[n].get("label", n), score) for n, score in top_users_raw]
+    top_channels = [(G.nodes[n].get("label", n), score) for n, score in top_channels_raw]
     return top_users, top_channels
 
 
@@ -1403,13 +1433,16 @@ with tab2:
     st.caption("Analyzes all data collected so far across YouTube, News, and Telegram")
 
     if st.button("Detect Trends", key="detect_trends_btn"):
-        with st.spinner("Analyzing trends across all collected data..."):
+        with st.spinner("Analyzing trends across all collected data (YouTube, News, Telegram combined)..."):
             all_docs = extract_all_documents()
-            trend_results = detect_trends(all_docs)
+            st.session_state["trend_results"] = detect_trends(all_docs) if all_docs else None
 
-        if not all_docs:
+    if "trend_results" in st.session_state:
+        trend_results = st.session_state["trend_results"]
+        if trend_results is None:
             st.warning("No data found yet. Run some searches first to collect data.")
         else:
+            st.caption("Left: words mentioned most often overall. Right: words whose mentions grew fastest in the last 24 hours compared to the previous 24 hours.")
             tr1, tr2 = st.columns(2)
             with tr1:
                 st.markdown("**Most Mentioned (all-time)**")
@@ -1448,8 +1481,10 @@ with tab2:
     if st.button("Analyze Demographics", key="analyze_demo_btn"):
         with st.spinner("Detecting languages and interest categories..."):
             all_docs = extract_all_documents()
-            demo_results = analyze_demographics(all_docs)
+            st.session_state["demo_results"] = analyze_demographics(all_docs)
 
+    if "demo_results" in st.session_state:
+        demo_results = st.session_state["demo_results"]
         if demo_results["total_documents_analyzed"] == 0:
             st.warning("No data found yet. Run some searches first to collect data.")
         else:
@@ -1458,10 +1493,10 @@ with tab2:
                 st.markdown("**Language Distribution**")
                 for lang, stats in demo_results["language_distribution"].items():
                     st.markdown(
-                        f"<div style='margin-bottom:8px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
-                        f"<span style='color:#2C2C2A;'>{lang}</span><span style='color:#5F5E5A;'>{stats['percent']}%</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='margin-bottom:10px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;'>"
+                        f"<span style='color:#2C2C2A;'>{lang}</span><span style='color:#5F5E5A;'>{stats['percent']}% of messages</span></div>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:10px;overflow:hidden;'>"
                         f"<div style='width:{stats['percent']}%;background:#3B8AD9;height:100%;'></div></div></div>",
                         unsafe_allow_html=True
                     )
@@ -1472,10 +1507,10 @@ with tab2:
                 for category, count in interests.items():
                     bar_pct = round(count / max_mentions * 100)
                     st.markdown(
-                        f"<div style='margin-bottom:8px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
-                        f"<span style='color:#2C2C2A;'>{category}</span><span style='color:#5F5E5A;'>{count}</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='margin-bottom:10px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;'>"
+                        f"<span style='color:#2C2C2A;'>{category}</span><span style='color:#5F5E5A;'>{count} mentions</span></div>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:10px;overflow:hidden;'>"
                         f"<div style='width:{bar_pct}%;background:#B15FC9;height:100%;'></div></div></div>",
                         unsafe_allow_html=True
                     )
@@ -1486,8 +1521,10 @@ with tab2:
 
     if st.button("Build Network Graph", key="build_network_btn"):
         with st.spinner("Building network graph..."):
-            G = build_network_graph()
+            st.session_state["network_graph"] = build_network_graph()
 
+    if "network_graph" in st.session_state:
+        G = st.session_state["network_graph"]
         if G.number_of_nodes() == 0:
             st.warning("No Telegram data found yet. Search Telegram above first to collect data.")
         else:
@@ -1496,27 +1533,29 @@ with tab2:
             nc1, nc2 = st.columns(2)
             with nc1:
                 st.markdown("**Top Influential Users**")
+                st.caption("Users active across the most different channels")
                 max_user_score = max([s for _, s in top_users], default=1)
                 for user, score in top_users:
                     bar_pct = round(score / max_user_score * 100)
                     st.markdown(
-                        f"<div style='margin-bottom:8px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
-                        f"<span style='color:#2C2C2A;'>{user}</span><span style='color:#5F5E5A;'>{score} channel(s)</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='margin-bottom:10px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;'>"
+                        f"<span style='color:#2C2C2A;'>{user}</span><span style='color:#5F5E5A;'>active in {score} channel(s)</span></div>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:10px;overflow:hidden;'>"
                         f"<div style='width:{bar_pct}%;background:#639922;height:100%;'></div></div></div>",
                         unsafe_allow_html=True
                     )
             with nc2:
                 st.markdown("**Top Channels by Reach**")
+                st.caption("Channels with the most distinct participants")
                 max_channel_score = max([s for _, s in top_channels], default=1)
                 for channel, score in top_channels:
                     bar_pct = round(score / max_channel_score * 100)
                     st.markdown(
-                        f"<div style='margin-bottom:8px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
+                        f"<div style='margin-bottom:10px;'>"
+                        f"<div style='display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;'>"
                         f"<span style='color:#2C2C2A;'>{channel}</span><span style='color:#5F5E5A;'>{score} user(s)</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                        f"<div style='background:#F0EEE8;border-radius:5px;height:10px;overflow:hidden;'>"
                         f"<div style='width:{bar_pct}%;background:#E24B4A;height:100%;'></div></div></div>",
                         unsafe_allow_html=True
                     )
