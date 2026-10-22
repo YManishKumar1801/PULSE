@@ -1,0 +1,44 @@
+{
+  "generated_at": "2026-10-09T10:12:08+00:00",
+  "environment": {
+    "platform": "Windows-11-10.0.26300-SP0",
+    "python": "3.14.7",
+    "cpu_count": 16,
+    "torch": "2.13.0+cpu",
+    "cuda_available": false
+  },
+  "not_measured": [
+    "Kafka consumer lag: the current app does not run a continuously consuming worker, so there is no lag to measure.",
+    "End-to-end latency from a live source to the dashboard."
+  ],
+  "stored_events": 1223,
+  "pipeline": {
+    "status": "ok",
+    "events": 1223,
+    "seconds": 2.238,
+    "pipeline_status": "ok",
+    "signals": 0
+  },
+  "sentiment_inference": {
+    "items": 128,
+    "chunks": 4,
+    "total_seconds": 6.86,
+    "items_per_second": 18.66,
+    "chunk_latency_avg_seconds": 1.715,
+    "chunk_latency_p95_seconds": 2.3,
+    "chunk_size": 32,
+    "status": "ok",
+    "note": "Models are warmed up first. Measures sentiment, emotion and sarcasm together. Database writes excluded."
+  },
+  "mongo_writes": {
+    "items": 2000,
+    "chunks": 4,
+    "total_seconds": 8.822,
+    "items_per_second": 226.71,
+    "chunk_latency_avg_seconds": 2.205,
+    "chunk_latency_p95_seconds": 2.383,
+    "status": "ok",
+    "batch_size": 500,
+    "note": "Upserts into a temporary collection that is dropped afterwards. Includes network round trips to MongoDB Atlas."
+  }
+}

@@ -1,25 +1,32 @@
 import streamlit as st
+import pandas as pd
 from googleapiclient.discovery import build
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from transformers import pipeline
 from pymongo import MongoClient
 from kafka import KafkaProducer, KafkaConsumer
 from telethon.sync import TelegramClient
-from telethon.tl.functions.contacts import SearchRequest
-import networkx as nx
 from pyvis.network import Network as PyvisNetwork
-from langdetect import detect, LangDetectException
-from collections import Counter
-from datetime import datetime, timezone, timedelta
-import re
+from datetime import datetime, timezone
 import html
 import requests
 import json
 import uuid
 import math
+import time
 import os
 import asyncio
 from dotenv import load_dotenv
+from ingestion.normalizer import normalize
+from intelligence.audience import build_audience_segments, segments_for_keyword
+from config.env import describe_missing, get_int_env
+from ingestion.sources import SourceError, fetch_news, fetch_telegram_messages, fetch_youtube_comments, search_telegram_channels as search_channels, search_youtube_videos
+from intelligence.explain import explain_signal
+from intelligence.gemini_client import generate_text
+from intelligence.network import analyze_network
+from intelligence.overview import command_center_summary, sentiment_overview, worker_summary
+from intelligence.sentiment import analyze_events, analyze_text
+from intelligence.signals import run_pipeline
+from intelligence.trends import detect_topic_trends
+from storage.mongodb import fetch_events, fetch_signals, fetch_worker_status, save_analyses, save_events, save_signals
 
 load_dotenv()
 
@@ -28,7 +35,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
+TELEGRAM_API_ID = get_int_env("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 KAFKA_BROKER = "localhost:9092"
 KAFKA_TOPIC = "pulse-youtube"
@@ -36,7 +43,7 @@ KAFKA_TOPIC = "pulse-youtube"
 FIREBASE_SIGNIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
 FIREBASE_SIGNUP_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
 
-st.set_page_config(page_title="PULSE - Live Sentiment Dashboard", layout="wide")
+st.set_page_config(page_title="PULSE - Live Audience Intelligence", layout="wide", initial_sidebar_state="expanded")
 
 class PulseError(Exception):
     pass
@@ -66,12 +73,9 @@ def firebase_signup(email, password):
 
 st.markdown("""
 <style>
-header[data-testid="stHeader"] { display: none !important; }
-div[data-testid="stToolbar"] { display: none !important; }
-div[data-testid="stHeaderActionElements"] { display: none !important; }
 .stApp h1 a, .stApp h2 a, .stApp h3 a, .stApp h4 a { display: none !important; }
 .stApp { background-color: #FAF9F6; }
-.block-container { padding-top: 2rem; max-width: 1100px; }
+.block-container { padding-top: 5rem; max-width: 1200px; }
 
 h1, h2, h3, h4, h5, h6 { color: #2C2C2A !important; }
 p, span, label, .stMarkdown, .stCaption, div[data-testid="stCaptionContainer"] { color: #2C2C2A !important; }
@@ -281,6 +285,8 @@ def get_telegram_loop():
 
 @st.cache_resource
 def get_telegram_client():
+    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
+        raise RuntimeError("TELEGRAM_API_ID or TELEGRAM_API_HASH is not set")
     loop = get_telegram_loop()
     asyncio.set_event_loop(loop)
     client = TelegramClient("pulse_session", TELEGRAM_API_ID, TELEGRAM_API_HASH, loop=loop)
@@ -288,24 +294,9 @@ def get_telegram_client():
     return client
 
 @st.cache_resource
-def get_vader():
-    return SentimentIntensityAnalyzer()
-
-@st.cache_resource
-def get_bert():
-    return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-
-@st.cache_resource
-def get_multilingual_sentiment():
-    return pipeline("sentiment-analysis", model="cardiffnlp/twitter-xlm-roberta-base-sentiment")
-
-@st.cache_resource
-def get_emotion_classifier():
-    return pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base")
-
-@st.cache_resource
-def get_sarcasm_classifier():
-    return pipeline("text-classification", model="helinivan/english-sarcasm-detector")
+def warm_up_sentiment_engine():
+    analyze_text("This is a short sentence used to load the sentiment models.")
+    return True
 
 @st.cache_resource
 def get_mongo_collection():
@@ -330,19 +321,47 @@ def get_kafka_producer():
         value_serializer=lambda v: json.dumps(v).encode("utf-8")
     )
 
-with st.spinner("Loading models... (first run takes longer)"):
-    youtube = get_youtube_client()
-    telegram_client = get_telegram_client()
-    vader_analyzer = get_vader()
-    bert_classifier = get_bert()
-    xlm_classifier = get_multilingual_sentiment()
-    emotion_classifier = get_emotion_classifier()
-    sarcasm_classifier = get_sarcasm_classifier()
-    sentiment_collection = get_mongo_collection()
-    telegram_collection = get_telegram_collection()
-    demographics_collection = get_demographics_collection()
-    kafka_producer = get_kafka_producer()
+def safe_init(name, factory):
+    try:
+        return factory(), None
+    except Exception as error:
+        return None, f"{name}: {error}"
 
+
+with st.spinner("Loading models... (first run takes longer)"):
+    startup_errors = []
+    youtube, error = safe_init("YouTube", get_youtube_client)
+    if error:
+        startup_errors.append(error)
+    telegram_client, error = safe_init("Telegram", get_telegram_client)
+    if error:
+        startup_errors.append(error)
+    sentiment_ready, error = safe_init("Sentiment models", warm_up_sentiment_engine)
+    if error:
+        startup_errors.append(error)
+    sentiment_collection, error = safe_init("MongoDB", get_mongo_collection)
+    if error:
+        startup_errors.append(error)
+    telegram_collection, error = safe_init("MongoDB", get_telegram_collection)
+    demographics_collection, error = safe_init("MongoDB", get_demographics_collection)
+    kafka_producer, error = safe_init("Kafka", get_kafka_producer)
+    if error:
+        startup_errors.append("Kafka: the broker is not reachable. Start it with docker-compose up -d.")
+
+missing_notes = [
+    describe_missing("YouTube search", ["YOUTUBE_API_KEY"]),
+    describe_missing("News search", ["NEWS_API_KEY"]),
+    describe_missing("Gemini explanations", ["GEMINI_API_KEY"]),
+    describe_missing("Database features", ["MONGO_URI"]),
+    describe_missing("Telegram search", ["TELEGRAM_API_ID", "TELEGRAM_API_HASH"]),
+]
+missing_notes = [note for note in missing_notes if note]
+if startup_errors or missing_notes:
+    with st.expander("Some services are unavailable. The rest of PULSE still works.", expanded=False):
+        for note in missing_notes:
+            st.markdown(f"- {note}")
+        for note in startup_errors:
+            st.markdown(f"- {note}")
 
 
 @st.cache_data(ttl=3600)
@@ -366,226 +385,83 @@ def fetch_trending_topics(region="IN", max_results=5):
 
 def search_videos_by_keyword(keyword, max_results=12):
     try:
-        request = youtube.search().list(
-            part="snippet", q=keyword, type="video",
-            order="relevance", maxResults=max_results, regionCode="IN"
-        )
-        response = request.execute()
-    except Exception as e:
-        error_text = str(e)
-        if "quotaExceeded" in error_text or "quota" in error_text.lower():
-            raise PulseError("YouTube API daily quota has been used up. Try again tomorrow, or use a different API key.")
-        if "blocked" in error_text.lower() or "forbidden" in error_text.lower():
-            raise PulseError("YouTube API key isn't authorized for this request. Check API key restrictions in Google Cloud Console.")
-        raise PulseError("Couldn't reach YouTube right now. Check your internet connection and try again.")
-
-    video_ids = [item["id"]["videoId"] for item in response["items"] if "videoId" in item["id"]]
-    if not video_ids:
-        return []
-
-    try:
-        stats_request = youtube.videos().list(part="snippet,statistics", id=",".join(video_ids))
-        stats_response = stats_request.execute()
-    except Exception:
-        return []
-
-    videos = []
-    for item in stats_response["items"]:
-        videos.append({
-            "video_id": item["id"],
-            "title": item["snippet"]["title"],
-            "channel": item["snippet"]["channelTitle"],
-            "views": item["statistics"].get("viewCount"),
-        })
-    return videos
+        return search_youtube_videos(youtube, keyword, max_results)
+    except SourceError as error:
+        raise PulseError(str(error))
 
 
 def get_video_comments(video_id, max_results=40):
-    comments = []
-    try:
-        request = youtube.commentThreads().list(
-            part="snippet", videoId=video_id, maxResults=max_results, order="relevance"
-        )
-        response = request.execute()
-        for item in response["items"]:
-            c = item["snippet"]["topLevelComment"]["snippet"]
-            comments.append({"text": c["textDisplay"], "author": c["authorDisplayName"], "likes": c["likeCount"]})
-    except Exception:
-        pass
-    return comments
+    return fetch_youtube_comments(youtube, video_id, max_results)
 
 
 def fetch_news_by_keyword(keyword, max_results=15):
-    url = "https://newsapi.org/v2/everything"
-    params = {
-        "q": keyword,
-        "apiKey": NEWS_API_KEY,
-        "language": "en",
-        "sortBy": "relevancy",
-        "pageSize": max_results
-    }
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code != 200:
-            return []
-        data = response.json()
-    except Exception:
-        return []
-
-    articles = []
-    for item in data.get("articles", []):
-        title = item.get("title") or ""
-        description = item.get("description") or ""
-        text = f"{title}. {description}".strip()
-        source = (item.get("source") or {}).get("name") or "Unknown source"
-
-        if len(text) < 15:
-            continue
-
-        articles.append({
-            "video_id": item.get("url") or f"news-{uuid.uuid4()}",
-            "title": title,
-            "channel": source,
-            "views": None,
-            "comments": [{"text": text, "author": source, "likes": 0}]
-        })
+    articles, warning = fetch_news(NEWS_API_KEY, keyword, max_results)
+    if warning:
+        st.warning(warning)
     return articles
 
 
-def clean_text(text):
-    if not text:
-        return ""
-    text = html.unescape(text)
-    text = re.sub(r"http\S+|www\S+", "", text)
-    text = re.sub(r"<.*?>", "", text)
-    text = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF]", "", text)
-    text = re.sub(r"[^a-zA-Z0-9\u0900-\u097F\s.,!?']", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+PLATFORM_LABELS = {"youtube": "YouTube", "news": "News", "telegram": "Telegram"}
 
 
-def get_vader_sentiment(text):
-    if not text:
-        return "Neutral", 0.0
-    scores = vader_analyzer.polarity_scores(text)
-    compound = scores["compound"]
-    label = "Positive" if compound >= 0.05 else "Negative" if compound <= -0.05 else "Neutral"
-    return label, compound
-
-
-def get_bert_sentiment(text):
-    if not text or len(text.strip()) == 0:
-        return "Neutral", 0.0
-    result = bert_classifier(text[:512])[0]
-    label = "Positive" if result["label"] == "POSITIVE" else "Negative"
-    score = result["score"]
-    if score < 0.75:
-        label = "Neutral"
-    return label, round(score, 3)
-
-
-def get_xlm_sentiment(text):
-    if not text or len(text.strip()) == 0:
-        return "Neutral", 0.0
-    try:
-        result = xlm_classifier(text[:512])[0]
-        label_map = {"positive": "Positive", "neutral": "Neutral", "negative": "Negative"}
-        label = label_map.get(result["label"].lower(), "Neutral")
-        return label, round(result["score"], 3)
-    except Exception:
-        return "Neutral", 0.0
-
-
-def ensemble_sentiment(v_label, b_label, x_label):
-    votes = [v_label, b_label, x_label]
-    counts = {}
-    for v in votes:
-        counts[v] = counts.get(v, 0) + 1
-    best_label = max(counts, key=counts.get)
-    if counts[best_label] >= 2:
-        return best_label
-    return x_label
-
-
-def is_sarcastic(text):
-    if not text or len(text) < 10:
-        return False
-    try:
-        result = sarcasm_classifier(text[:512])[0]
-        return result["label"].lower() in ("sarcastic", "label_1", "1") and result["score"] >= 0.6
-    except Exception:
-        return False
-
-
-def compute_emotion_breakdown(comments, sample_size=40):
-    candidates = [c for c in comments if c["text"] and len(c["text"]) >= 15]
-    candidates.sort(key=lambda c: c.get("confidence", 0), reverse=True)
-    sample = candidates[:sample_size]
-
-    if not sample:
-        return {}
-
+def compute_emotion_breakdown(comments):
     emotion_counts = {}
-    for c in sample:
-        try:
-            result = emotion_classifier(c["text"][:512])[0]
-            label = result["label"]
+    for c in comments:
+        emotion = c.get("emotion")
+        if emotion:
+            label = emotion["label"]
             emotion_counts[label] = emotion_counts.get(label, 0) + 1
-        except Exception:
-            continue
 
     total = sum(emotion_counts.values())
     if total == 0:
         return {}
 
-    return {label: round(count / total * 100) for label, count in sorted(emotion_counts.items(), key=lambda x: x[1], reverse=True)}
+    ordered = sorted(emotion_counts.items(), key=lambda x: x[1], reverse=True)
+    return {label: round(count / total * 100) for label, count in ordered}
+
+
+def analyze_and_store_events(events):
+    if not events:
+        return []
+    try:
+        save_events(events)
+    except Exception as e:
+        print("Event storage failed:", e)
+    results = analyze_events(events)
+    try:
+        save_analyses(results)
+    except Exception as e:
+        print("Analysis storage failed:", e)
+    return results
+
+
+def build_comment_records(events, results):
+    analysis_by_id = dict(results)
+    records = []
+    for event in events:
+        analysis = analysis_by_id.get(event["event_id"])
+        if analysis is None:
+            continue
+        sentiment = analysis["sentiment"]
+        records.append({
+            "event_id": event["event_id"],
+            "text": analysis["cleaned_text"],
+            "sentiment": sentiment["label"],
+            "confidence": sentiment["confidence_proxy"],
+            "platform": PLATFORM_LABELS.get(event["platform"], event["platform"]),
+            "video_title": event.get("source_name"),
+            "language": analysis["language"]["name"],
+            "emotion": analysis.get("emotion"),
+            "sarcasm": analysis.get("sarcasm")
+        })
+    return records
 
 
 def generate_gemini_summary(prompt):
-    """Generate a short reason summary using Gemini 3.5 Flash."""
-    if not GEMINI_API_KEY:
-        return None
-
-    try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
-
-        response = requests.post(
-            url,
-            headers={
-                "x-goog-api-key": GEMINI_API_KEY,
-                "Content-Type": "application/json"
-            },
-            json={
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": prompt}
-                        ]
-                    }
-                ]
-            },
-            timeout=30
-        )
-
-        if response.status_code != 200:
-            print("Gemini API Error:", response.status_code, response.text)
-            return None
-
-        data = response.json()
-        candidates = data.get("candidates", [])
-        if not candidates:
-            print("Gemini returned no candidates:", data)
-            return None
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text_parts = [part.get("text", "") for part in parts if part.get("text")]
-        result = " ".join(text_parts).strip()
-
-        return result if result else None
-
-    except Exception as e:
-        print("Gemini Exception:", e)
-        return None
+    result = generate_text(prompt, GEMINI_API_KEY)
+    if result["error"]:
+        print("Gemini error:", result["error"])
+    return result["text"]
 
 
 def generate_reason_summary(comments, sentiment_label, keyword, max_input_comments=8):
@@ -628,6 +504,7 @@ def publish_to_kafka(request_id, keyword, item, comments, platform):
         "title": item["title"],
         "channel": item["channel"],
         "views": item.get("views"),
+        "raw": item.get("raw"),
         "comments": comments
     }
     kafka_producer.send(KAFKA_TOPIC, value=message)
@@ -659,34 +536,18 @@ def read_messages_from_kafka(request_id, expected_count, timeout_seconds=45):
 
 
 def search_telegram_channels(keyword, max_results=5):
-    try:
+    if telegram_client is not None:
         asyncio.set_event_loop(get_telegram_loop())
-        result = telegram_client(SearchRequest(q=keyword, limit=max_results))
-        channels = []
-        for chat in result.chats:
-            username = getattr(chat, "username", None)
-            if username:
-                channels.append({"id": chat.id, "title": getattr(chat, "title", ""), "username": username})
-        return channels, None
-    except Exception as e:
-        return [], str(e)
+    return search_channels(telegram_client, keyword, max_results)
 
 
 def fetch_channel_messages(username, limit=50):
-    messages = []
-    try:
-        asyncio.set_event_loop(get_telegram_loop())
-        entity = telegram_client.get_entity(username)
-        for message in telegram_client.iter_messages(entity, limit=limit):
-            if message.text:
-                messages.append({
-                    "text": message.text,
-                    "date": message.date,
-                    "sender_id": message.sender_id,
-                    "views": getattr(message, "views", None)
-                })
-    except Exception:
-        pass
+    if telegram_client is None:
+        return []
+    asyncio.set_event_loop(get_telegram_loop())
+    messages, error = fetch_telegram_messages(telegram_client, username, limit)
+    if error:
+        st.warning(error)
     return messages
 
 
@@ -700,21 +561,32 @@ def analyze_telegram_keyword(keyword):
 
     for ch in channels:
         messages = fetch_channel_messages(ch["username"])
+
+        telegram_events = normalize(
+            "telegram",
+            [{
+                "channel_title": ch["title"],
+                "channel_username": ch["username"],
+                "messages": messages
+            }],
+            keyword
+        )
+        results = analyze_and_store_events(telegram_events)
+        analysis_by_id = dict(results)
+
         message_docs = []
 
-        for msg in messages:
-            cleaned = clean_text(msg["text"])
-            v_label, v_score = get_vader_sentiment(cleaned)
-            b_label, b_score = get_bert_sentiment(cleaned)
-            x_label, x_score = get_xlm_sentiment(cleaned)
-            final = ensemble_sentiment(v_label, b_label, x_label)
-
-            counts[final] += 1
+        for event in telegram_events:
+            analysis = analysis_by_id.get(event["event_id"])
+            if analysis is None:
+                continue
+            label = analysis["sentiment"]["label"]
+            counts[label] += 1
             message_docs.append({
-                "text": cleaned,
-                "sentiment": final,
-                "date": str(msg["date"]),
-                "sender_id": msg["sender_id"]
+                "text": analysis["cleaned_text"],
+                "sentiment": label,
+                "date": event["timestamp"],
+                "sender_id": event["author_id"]
             })
 
         document = {
@@ -727,11 +599,14 @@ def analyze_telegram_keyword(keyword):
             "total_messages": len(message_docs)
         }
 
-        telegram_collection.update_one(
-            {"channel_username": ch["username"], "keyword": keyword},
-            {"$set": document},
-            upsert=True
-        )
+        try:
+            telegram_collection.update_one(
+                {"channel_username": ch["username"], "keyword": keyword},
+                {"$set": document},
+                upsert=True
+            )
+        except Exception as error:
+            st.warning(f"Couldn't save @{ch['username']} to the database: {error}")
 
         all_results.append(document)
 
@@ -739,203 +614,42 @@ def analyze_telegram_keyword(keyword):
     return {"channels": all_results, "counts": counts, "total": total}, None
 
 
-TREND_STOPWORDS = set("""
-a about above after again against all am an and any are aren't as at be because been
-before being below between both but by can't cannot could couldn't did didn't do does
-doesn't doing don't down during each few for from further had hadn't has hasn't have
-haven't having he he'd he'll he's her here here's hers herself him himself his how
-how's i i'd i'll i'm i've if in into is isn't it it's its itself let's me more most
-mustn't my myself no nor not of off on once only or other ought our ours ourselves out
-over own same shan't she she'd she'll she's should shouldn't so some such than that
-that's the their theirs them themselves then there there's these they they'd they'll
-they're they've this those through to too under until up very was wasn't we we'd we'll
-we're we've were weren't what what's when when's where where's which while who who's
-whom why why's with won't would wouldn't you you'd you'll you're you've your yours
-yourself yourselves is are was were video comment channel https http www com
-""".split())
+COMMUNITY_COLORS = [
+    "#639922", "#3B8AD9", "#D98A2B", "#B15FC9", "#E24B4A",
+    "#2BA6A0", "#8A6D3B", "#D4537E", "#5F7EA6", "#7A8B2E"
+]
+NETWORK_MAX_NODES = 300
 
 
-def extract_all_documents():
-    documents = []
-    for doc in sentiment_collection.find():
-        fetched_at = doc.get("fetched_at")
-        for c in doc.get("comments", []):
-            documents.append({
-                "text": c.get("cleaned_text") or c.get("original_text", ""),
-                "date": fetched_at,
-                "platform": doc.get("platform", "YouTube")
-            })
-    for doc in telegram_collection.find():
-        for m in doc.get("messages", []):
-            documents.append({
-                "text": m.get("text", ""),
-                "date": m.get("date"),
-                "platform": "Telegram"
-            })
-    return documents
-
-
-def tokenize_for_trends(text):
-    words = re.findall(r"[a-zA-Z\u0900-\u097F]{3,}", text.lower())
-    return [w for w in words if w not in TREND_STOPWORDS]
-
-
-def parse_trend_date(date_value):
-    if isinstance(date_value, datetime):
-        return date_value
-    if isinstance(date_value, str):
-        try:
-            return datetime.fromisoformat(date_value.replace("Z", "+00:00"))
-        except Exception:
-            return None
-    return None
-
-
-def detect_trends(documents, recent_hours=24, top_n=15):
-    now = datetime.now(timezone.utc)
-    recent_cutoff = now - timedelta(hours=recent_hours)
-    older_cutoff = recent_cutoff - timedelta(hours=recent_hours)
-
-    recent_counter = Counter()
-    older_counter = Counter()
-    overall_counter = Counter()
-
-    for doc in documents:
-        words = tokenize_for_trends(doc["text"])
-        overall_counter.update(words)
-
-        date = parse_trend_date(doc["date"])
-        if date is None:
-            continue
-        if date.tzinfo is None:
-            date = date.replace(tzinfo=timezone.utc)
-
-        if date >= recent_cutoff:
-            recent_counter.update(words)
-        elif date >= older_cutoff:
-            older_counter.update(words)
-
-    trending = []
-    for word, recent_count in recent_counter.items():
-        older_count = older_counter.get(word, 0)
-        growth = recent_count - older_count
-        trending.append((word, recent_count, older_count, growth))
-    trending.sort(key=lambda x: x[3], reverse=True)
-
-    return {
-        "most_mentioned_overall": overall_counter.most_common(top_n),
-        "trending_now": trending[:top_n]
-    }
-
-
-LANGUAGE_NAMES = {
-    "en": "English", "hi": "Hindi", "mr": "Marathi", "ta": "Tamil",
-    "te": "Telugu", "bn": "Bengali", "gu": "Gujarati", "kn": "Kannada",
-    "ml": "Malayalam", "pa": "Punjabi", "ur": "Urdu", "ne": "Nepali"
-}
-
-INTEREST_CATEGORIES = {
-    "Technology": ["tech", "phone", "app", "software", "ai", "computer", "internet", "gadget", "device", "code"],
-    "Sports": ["cricket", "match", "team", "player", "score", "goal", "tournament", "ipl", "football", "kohli"],
-    "Politics": ["government", "minister", "election", "party", "policy", "parliament", "vote", "modi", "gandhi"],
-    "Entertainment": ["movie", "film", "actor", "actress", "song", "music", "show", "trailer", "release", "bollywood"],
-    "Finance": ["price", "market", "stock", "money", "economy", "tax", "inflation", "budget", "rupee", "investment"],
-    "Automobile": ["car", "bike", "vehicle", "petrol", "diesel", "mileage", "engine", "fuel", "e20", "ethanol"]
-}
-
-
-def detect_language(text):
-    if not text or len(text.strip()) < 10:
-        return "unknown"
-    try:
-        code = detect(text)
-        return LANGUAGE_NAMES.get(code, code)
-    except LangDetectException:
-        return "unknown"
-
-
-def tag_interests(text):
-    text_lower = text.lower()
-    matched = []
-    for category, keywords in INTEREST_CATEGORIES.items():
-        if any(re.search(r"\b" + re.escape(kw) + r"\b", text_lower) for kw in keywords):
-            matched.append(category)
-    return matched
-
-
-def analyze_demographics(documents):
-    language_counter = Counter()
-    interest_counter = Counter()
-    platform_language = {}
-
-    for doc in documents:
-        text = doc["text"]
-        if not text:
-            continue
-        lang = detect_language(text)
-        language_counter[lang] += 1
-
-        platform = doc["platform"]
-        if platform not in platform_language:
-            platform_language[platform] = Counter()
-        platform_language[platform][lang] += 1
-
-        for category in tag_interests(text):
-            interest_counter[category] += 1
-
-    total = sum(language_counter.values())
-    language_distribution = {
-        lang: {"count": count, "percent": round(count / total * 100, 1)}
-        for lang, count in language_counter.most_common()
-    } if total > 0 else {}
-
-    return {
-        "language_distribution": language_distribution,
-        "interest_distribution": dict(interest_counter.most_common()),
-        "platform_language_breakdown": {p: dict(c.most_common()) for p, c in platform_language.items()},
-        "total_documents_analyzed": total
-    }
-
-
-def build_network_graph():
-    G = nx.Graph()
-    for doc in telegram_collection.find():
-        channel = doc.get("channel_username") or doc.get("channel_title")
-        if not channel:
-            continue
-        channel_node = f"channel::{channel}"
-        G.add_node(channel_node, type="channel", label=doc.get("channel_title", channel))
-        for m in doc.get("messages", []):
-            sender = m.get("sender_id")
-            if sender is None:
-                continue
-            sender_node = f"user::{sender}"
-            G.add_node(sender_node, type="user", label=f"User {sender}")
-            if G.has_edge(sender_node, channel_node):
-                G[sender_node][channel_node]["weight"] += 1
-            else:
-                G.add_edge(sender_node, channel_node, weight=1)
-    return G
-
-
-def compute_network_influence(G):
-    user_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "user"]
-    channel_nodes = [n for n, d in G.nodes(data=True) if d.get("type") == "channel"]
-    influence = {n: G.degree(n) for n in user_nodes}
-    reach = {n: G.degree(n) for n in channel_nodes}
-    top_users_raw = sorted(influence.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_channels_raw = sorted(reach.items(), key=lambda x: x[1], reverse=True)[:10]
-    top_users = [(G.nodes[n].get("label", n), score) for n, score in top_users_raw]
-    top_channels = [(G.nodes[n].get("label", n), score) for n, score in top_channels_raw]
-    return top_users, top_channels
+def community_color(community_id):
+    if not community_id:
+        return "#B4B2A9"
+    return COMMUNITY_COLORS[(int(community_id.split("_")[1]) - 1) % len(COMMUNITY_COLORS)]
 
 
 def generate_network_html(G, output_file="network_graph.html"):
+    if G.number_of_nodes() > NETWORK_MAX_NODES:
+        keep = sorted(G.nodes, key=lambda n: G.nodes[n].get("pagerank", 0), reverse=True)[:NETWORK_MAX_NODES]
+        G = G.subgraph(keep)
+
+    max_rank = max([data.get("pagerank", 0) for _, data in G.nodes(data=True)], default=0) or 1
     net = PyvisNetwork(height="600px", width="100%", bgcolor="#FAF9F6", font_color="#2C2C2A")
     for node, data in G.nodes(data=True):
-        color = "#639922" if data.get("type") == "channel" else "#3B8AD9"
-        size = 25 if data.get("type") == "channel" else 12
-        net.add_node(node, label=data.get("label", node), color=color, size=size)
+        color = community_color(data.get("community"))
+        is_bridge = bool(data.get("bridge"))
+        title = (
+            f"{html.escape(str(data.get('label', node)))}<br>{data.get('type')} · {data.get('messages', 0)} messages"
+            f"<br>{data.get('community') or 'minor community'}{' · bridge node' if is_bridge else ''}"
+        )
+        net.add_node(
+            node,
+            label=str(data.get("label", node)),
+            title=title,
+            shape="dot" if data.get("type") == "author" else "square",
+            size=10 + 30 * data.get("pagerank", 0) / max_rank,
+            borderWidth=4 if is_bridge else 1,
+            color={"background": color, "border": "#2C2C2A" if is_bridge else color}
+        )
     for source, target, data in G.edges(data=True):
         net.add_edge(source, target, value=data.get("weight", 1))
     net.write_html(output_file)
@@ -943,6 +657,8 @@ def generate_network_html(G, output_file="network_graph.html"):
 
 
 def analyze_keyword(keyword):
+    if kafka_producer is None:
+        raise PulseError("Kafka is not running. Start it with docker-compose up -d and restart the app.")
     videos = search_videos_by_keyword(keyword)
     news_articles = fetch_news_by_keyword(keyword)
 
@@ -968,33 +684,24 @@ def analyze_keyword(keyword):
     total_items = len(videos) + len(news_articles)
     consumed_items = read_messages_from_kafka(request_id, expected_count=total_items)
 
+    events = []
+    for item in consumed_items:
+        if item.get("platform") == "News" and item.get("raw"):
+            events.extend(normalize("news", [item["raw"]], keyword))
+        elif item.get("platform", "YouTube") == "YouTube":
+            events.extend(normalize("youtube", [item], keyword))
+
+    results = analyze_and_store_events(events)
+    all_comments = build_comment_records(events, results)
+
     counts = {"Positive": 0, "Negative": 0, "Neutral": 0}
     platform_counts = {"YouTube": 0, "News": 0}
-    all_comments = []
+    for c in all_comments:
+        counts[c["sentiment"]] += 1
+        platform_counts[c["platform"]] = platform_counts.get(c["platform"], 0) + 1
 
     for item in consumed_items:
         platform = item.get("platform", "YouTube")
-        for c in item["comments"]:
-            cleaned = clean_text(c["text"])
-            v_label, v_score = get_vader_sentiment(cleaned)
-            b_label, b_score = get_bert_sentiment(cleaned)
-            x_label, x_score = get_xlm_sentiment(cleaned)
-            final = ensemble_sentiment(v_label, b_label, x_label)
-            counts[final] += 1
-            platform_counts[platform] = platform_counts.get(platform, 0) + 1
-            matching_scores = []
-            if v_label == final:
-                matching_scores.append(abs(v_score))
-            if b_label == final:
-                matching_scores.append(b_score)
-            if x_label == final:
-                matching_scores.append(x_score)
-            confidence = max(matching_scores) if matching_scores else 0.5
-            all_comments.append({
-                "text": cleaned, "sentiment": final, "video_title": item["title"],
-                "platform": platform, "confidence": confidence
-            })
-
         try:
             sentiment_collection.update_one(
                 {"video_id": item["video_id"], "keyword": keyword},
@@ -1088,7 +795,8 @@ def render_result(result, key_prefix):
         with st.spinner("Summarizing why people feel this way..."):
             pos_reason = generate_reason_summary(result["comments"], "Positive", result["keyword"])
             neg_reason = generate_reason_summary(result["comments"], "Negative", result["keyword"])
-        st.session_state[reason_key] = (pos_reason, neg_reason)
+        if not (pos_reason.startswith("Could not generate") or neg_reason.startswith("Could not generate")):
+            st.session_state[reason_key] = (pos_reason, neg_reason)
     else:
         pos_reason, neg_reason = st.session_state[reason_key]
 
@@ -1187,7 +895,7 @@ def render_result(result, key_prefix):
     with st.expander("Show sample comments", key=f"{key_prefix}_comments_exp"):
         for c in result["comments"][:15]:
             color = "#3B6D11" if c["sentiment"] == "Positive" else "#A32D2D" if c["sentiment"] == "Negative" else "#5F5E5A"
-            sarcastic = is_sarcastic(c["text"])
+            sarcastic = bool(c.get("sarcasm") and c["sarcasm"]["flag"])
             sarcasm_badge = "<span style='color:#B15FC9;font-weight:600;font-size:11px;margin-left:8px;'>SARCASM?</span>" if sarcastic else ""
             st.markdown(
                 f"<div style='padding:6px 0;border-bottom:0.5px solid #F0EEE8;'>"
@@ -1198,28 +906,692 @@ def render_result(result, key_prefix):
             )
 
 
-hcol1, hcol2 = st.columns([4, 1])
-with hcol1:
-    st.markdown("""
-    <div class="pulse-brand">
-        <span class="pulse-dot" style="background:#639922;"></span>
-        <span class="pulse-dot" style="background:#B4B2A9;"></span>
-        <span class="pulse-dot" style="background:#E24B4A;"></span>
-        <span style="color:#2C2C2A;font-weight:600;font-size:18px;margin-left:6px;">PULSE</span>
-    </div>
-    """, unsafe_allow_html=True)
-    st.caption("Real-time public sentiment monitoring — YouTube & News")
-with hcol2:
-    if st.button("Log out", use_container_width=True, type="primary"):
+def render_audience_segments(result):
+    if result["status"] != "ok":
+        st.warning(
+            f"Not enough data to build segments. Found {result['usable_events']} usable messages, "
+            f"at least {result['min_required']} are needed. Run more searches first."
+        )
+        return
+
+    quality = result["silhouette"]
+    quality_text = f" · cluster quality {quality} (silhouette)" if quality is not None else ""
+    st.markdown(
+        f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 4px 0;'>{result['usable_events']} messages grouped into "
+        f"{len(result['segments'])} segments{quality_text} · {result['analyzed_events']} with sentiment</p>",
+        unsafe_allow_html=True
+    )
+    st.caption("Segments group similar messages by topic and wording. They describe conversations, not individual people.")
+
+    trend_colors = {"growing": "#3B6D11", "shrinking": "#A32D2D", "stable": "#5F5E5A"}
+
+    for segment in result["segments"]:
+        name = html.escape(segment["name"])
+        size_pct = round(segment["size"] * 100)
+
+        pills = "".join(
+            f"<span style='display:inline-block;background:#EAF3DE;color:#3B6D11;padding:3px 10px;border-radius:14px;"
+            f"font-size:12px;font-weight:600;margin:0 6px 6px 0;'>{html.escape(topic)}</span>"
+            for topic in segment["top_topics"]
+        )
+
+        sentiment = segment["sentiment"]
+        if sentiment:
+            pos = round(sentiment["positive"] * 100)
+            neu = round(sentiment["neutral"] * 100)
+            neg = round(sentiment["negative"] * 100)
+            sentiment_html = (
+                f"<div style='display:flex;width:100%;height:10px;border-radius:6px;overflow:hidden;background:#F0EEE8;'>"
+                f"<div style='width:{pos}%;background:#639922;'></div>"
+                f"<div style='width:{neu}%;background:#B4B2A9;'></div>"
+                f"<div style='width:{neg}%;background:#E24B4A;'></div></div>"
+                f"<div style='display:flex;justify-content:space-between;margin-top:4px;'>"
+                f"<span style='font-size:11px;color:#3B6D11;'>{pos}% positive</span>"
+                f"<span style='font-size:11px;color:#5F5E5A;'>{neu}% neutral</span>"
+                f"<span style='font-size:11px;color:#A32D2D;'>{neg}% negative</span></div>"
+            )
+        else:
+            sentiment_html = "<p style='color:#888780;font-size:12px;margin:0;'>Sentiment not available for this segment yet.</p>"
+
+        languages = ", ".join(f"{html.escape(item['name'])} {round(item['share'] * 100)}%" for item in segment["languages"])
+        platforms = ", ".join(f"{html.escape(platform)} {round(share * 100)}%" for platform, share in segment["platforms"].items())
+        engagement = segment["engagement"]
+        engagement_text = (
+            f"{engagement['avg_likes']} likes · {engagement['avg_replies']} replies · {engagement['avg_views']} views per message"
+        )
+
+        trend = segment["trend"]
+        if trend["status"] == "ok":
+            color = trend_colors.get(trend["label"], "#5F5E5A")
+            trend_html = (
+                f"<span style='color:{color};font-weight:600;'>{trend['label']}</span> "
+                f"({trend['shift_points']:+.1f} pts share, earlier vs later period)"
+            )
+        else:
+            trend_html = "<span style='color:#888780;'>not enough time history yet</span>"
+
+        st.markdown(
+            f"<div style='background:#fff;border-radius:14px;padding:18px 20px;border:0.5px solid #E5E2D9;"
+            f"box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:12px;'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;'>"
+            f"<span style='font-size:15px;font-weight:700;color:#2C2C2A;'>{name}</span>"
+            f"<span style='font-size:12px;color:#5F5E5A;'>{size_pct}% of messages · {segment['count']} messages</span></div>"
+            f"<div style='margin-bottom:10px;'>{pills}</div>"
+            f"{sentiment_html}"
+            f"<div style='margin-top:12px;font-size:12px;color:#5F5E5A;line-height:1.8;'>"
+            f"<div><b style='color:#2C2C2A;'>Languages:</b> {languages}</div>"
+            f"<div><b style='color:#2C2C2A;'>Sources:</b> {platforms}</div>"
+            f"<div><b style='color:#2C2C2A;'>Engagement:</b> {engagement_text}</div>"
+            f"<div><b style='color:#2C2C2A;'>Trend:</b> {trend_html}</div></div></div>",
+            unsafe_allow_html=True
+        )
+
+        with st.expander(f"Sample messages from {segment['segment_id']}"):
+            for text in segment["sample_texts"]:
+                st.markdown(
+                    f"<div style='padding:6px 0;border-bottom:0.5px solid #F0EEE8;font-size:13px;color:#2C2C2A;'>{html.escape(text)}</div>",
+                    unsafe_allow_html=True
+                )
+
+    keyword_rows = sorted(result["keyword_totals"].items(), key=lambda item: item[1], reverse=True)[:5]
+    if keyword_rows:
+        st.markdown("**Most associated segment per keyword**")
+        for keyword, _ in keyword_rows:
+            ranked = segments_for_keyword(result, keyword)
+            if not ranked:
+                continue
+            top = ranked[0]
+            st.markdown(
+                f"<div style='font-size:13px;padding:6px 0;border-bottom:0.5px solid #F0EEE8;color:#2C2C2A;'>"
+                f"<b>{html.escape(keyword)}</b> → {html.escape(top['name'])} "
+                f"<span style='color:#5F5E5A;'>({round(top['share_of_keyword'] * 100)}% of its messages · "
+                f"{top['lift']}x over-represented)</span></div>",
+                unsafe_allow_html=True
+            )
+
+
+def render_topic_trends(result):
+    if result["status"] == "insufficient_data":
+        st.warning(
+            f"Not enough data for topic trends. Found {result['usable_events']} usable messages, "
+            f"at least {result['min_required']} are needed. Run more searches first."
+        )
+        return
+    if result["status"] == "insufficient_history":
+        st.warning("All collected messages fall within a very short time span, so growth can't be measured yet. Collect data over a longer period.")
+        return
+
+    window = result["window_hours"]
+    st.markdown(
+        f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 4px 0;'>Latest {window:g}h compared with the {window:g}h before it · "
+        f"{result['usable_events']} messages · {len(result['topics'])} topics shown</p>",
+        unsafe_allow_html=True
+    )
+    notes = [
+        f"Topics with fewer than {result['min_volume']} mentions in a window are ignored ({result['dropped_low_volume']} dropped).",
+        "Topics come from a TF-IDF + NMF topic model, which groups words that appear together."
+    ]
+    if not result["persistence_evaluated"]:
+        notes.append("Persistent status needs at least three windows of history, so it is not assigned yet.")
+    st.caption(" ".join(notes))
+
+    if not result["topics"]:
+        st.info("No topic reached the minimum volume. Collect more data and try again.")
+        return
+
+    status_colors = {
+        "Emerging": "#D98A2B", "Rising": "#3B6D11", "Persistent": "#3B8AD9",
+        "Stable": "#5F5E5A", "Declining": "#A32D2D"
+    }
+
+    for topic in result["topics"]:
+        color = status_colors.get(topic["status"], "#5F5E5A")
+        growth_text = "new" if topic["growth_pct"] is None else f"{topic['growth_pct']:+.0f}%"
+        velocity_text = f"{topic['velocity']} ({topic['velocity_per_hour']:+.2f} messages/hour)"
+
+        sentiment = topic["sentiment"]
+        if sentiment["status"] == "ok":
+            prev_s = sentiment["previous"]
+            cur_s = sentiment["current"]
+            sentiment_color = "#A32D2D" if sentiment["direction"] == "more negative" else "#3B6D11" if sentiment["direction"] == "more positive" else "#5F5E5A"
+            sentiment_html = (
+                f"<span style='color:{sentiment_color};font-weight:600;'>{sentiment['direction']}</span> "
+                f"(negative {round(prev_s['negative_share'] * 100)}% → {round(cur_s['negative_share'] * 100)}%)"
+            )
+        else:
+            sentiment_html = "<span style='color:#888780;'>not enough analyzed messages in both windows</span>"
+
+        keywords = ", ".join(f"{html.escape(item['keyword'])} ({item['count']})" for item in topic["keywords"]) or "none"
+        terms = "".join(
+            f"<span style='display:inline-block;background:#F0EEE8;color:#2C2C2A;padding:3px 10px;border-radius:14px;"
+            f"font-size:12px;margin:0 6px 6px 0;'>{html.escape(term)}</span>"
+            for term in topic["terms"]
+        )
+
+        st.markdown(
+            f"<div style='background:#fff;border-radius:14px;padding:18px 20px;border:0.5px solid #E5E2D9;"
+            f"box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:12px;border-left:4px solid {color};'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;'>"
+            f"<span style='font-size:15px;font-weight:700;color:#2C2C2A;'>{html.escape(topic['name'])}</span>"
+            f"<span style='background:{color};color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;'>"
+            f"{topic['status'].upper()}</span></div>"
+            f"<div style='margin-bottom:8px;'>{terms}</div>"
+            f"<div style='display:flex;gap:28px;margin-bottom:8px;'>"
+            f"<div><div style='font-size:11px;color:#888780;'>Mentions</div>"
+            f"<div style='font-size:18px;font-weight:700;color:#2C2C2A;'>{topic['previous']} → {topic['current']}</div></div>"
+            f"<div><div style='font-size:11px;color:#888780;'>Growth</div>"
+            f"<div style='font-size:18px;font-weight:700;color:{color};'>{growth_text}</div></div></div>"
+            f"<div style='font-size:12px;color:#5F5E5A;line-height:1.8;'>"
+            f"<div><b style='color:#2C2C2A;'>Velocity:</b> {velocity_text}</div>"
+            f"<div><b style='color:#2C2C2A;'>Share of conversation:</b> {round(topic['share_previous'] * 100)}% → {round(topic['share_current'] * 100)}%</div>"
+            f"<div><b style='color:#2C2C2A;'>Sentiment:</b> {sentiment_html}</div>"
+            f"<div><b style='color:#2C2C2A;'>Keywords:</b> {keywords}</div></div></div>",
+            unsafe_allow_html=True
+        )
+
+        with st.expander(f"Sample messages from {topic['topic_id']}"):
+            for text in topic["sample_texts"]:
+                st.markdown(
+                    f"<div style='padding:6px 0;border-bottom:0.5px solid #F0EEE8;font-size:13px;color:#2C2C2A;'>{html.escape(text)}</div>",
+                    unsafe_allow_html=True
+                )
+
+
+def render_network_intelligence(result, graph):
+    for note in result["limitations"]:
+        st.caption(note)
+
+    if result["status"] != "ok":
+        st.warning(
+            f"Not enough network data. Found {result['network_events']} messages with a participant identity, "
+            f"at least {result['min_required']} are needed. Run more YouTube or Telegram searches first."
+        )
+        return
+
+    st.markdown(
+        f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 6px 0;'>{result['authors']} participants · {result['sources']} sources · "
+        f"{result['edges']} connections · {result['communities_significant']} communities "
+        f"(with at least {result['min_community_messages']} messages)</p>",
+        unsafe_allow_html=True
+    )
+
+    st.markdown("**Communities**")
+    for community in result["communities"]:
+        color = community_color(community["community_id"])
+        sentiment = community["sentiment"]
+        if sentiment:
+            pos = round(sentiment["positive"] * 100)
+            neu = round(sentiment["neutral"] * 100)
+            neg = round(sentiment["negative"] * 100)
+            sentiment_html = (
+                f"<div style='display:flex;width:100%;height:10px;border-radius:6px;overflow:hidden;background:#F0EEE8;'>"
+                f"<div style='width:{pos}%;background:#639922;'></div>"
+                f"<div style='width:{neu}%;background:#B4B2A9;'></div>"
+                f"<div style='width:{neg}%;background:#E24B4A;'></div></div>"
+                f"<div style='font-size:11px;color:#5F5E5A;margin-top:4px;'>{pos}% positive · {neu}% neutral · {neg}% negative</div>"
+            )
+        else:
+            sentiment_html = "<div style='font-size:12px;color:#888780;'>Sentiment not available yet.</div>"
+
+        terms = ", ".join(html.escape(term) for term in community["top_terms"]) or "none"
+        topics = ", ".join(f"{html.escape(item['name'])} ({item['count']})" for item in community["top_topics"]) or "no topic reached the minimum volume"
+        sources = ", ".join(f"{html.escape(item['label'])} ({item['messages']})" for item in community["top_sources"])
+        platforms = ", ".join(f"{html.escape(name)} {round(share * 100)}%" for name, share in community["platforms"].items())
+
+        st.markdown(
+            f"<div style='background:#fff;border-radius:14px;padding:16px 20px;border:0.5px solid #E5E2D9;"
+            f"box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:12px;border-left:4px solid {color};'>"
+            f"<div style='display:flex;justify-content:space-between;margin-bottom:10px;'>"
+            f"<span style='font-size:14px;font-weight:700;color:#2C2C2A;'>{community['community_id']}</span>"
+            f"<span style='font-size:12px;color:#5F5E5A;'>{community['authors']} participants · {community['sources']} sources · "
+            f"{community['messages']} messages</span></div>"
+            f"{sentiment_html}"
+            f"<div style='margin-top:10px;font-size:12px;color:#5F5E5A;line-height:1.8;'>"
+            f"<div><b style='color:#2C2C2A;'>Distinctive terms:</b> {terms}</div>"
+            f"<div><b style='color:#2C2C2A;'>Main topics:</b> {topics}</div>"
+            f"<div><b style='color:#2C2C2A;'>Main sources:</b> {sources}</div>"
+            f"<div><b style='color:#2C2C2A;'>Platforms:</b> {platforms}</div></div></div>",
+            unsafe_allow_html=True
+        )
+
+    st.markdown("**Bridge nodes**")
+    st.caption("Participants or sources whose activity is split across different communities (at least 20% outside their main one).")
+    if not result["bridge_nodes"]:
+        st.info("No bridge nodes found. They appear when the same participant is active in sources that belong to different communities.")
+    for node in result["bridge_nodes"]:
+        connected = ", ".join(node["communities_connected"])
+        st.markdown(
+            f"<div style='font-size:13px;padding:8px 0;border-bottom:0.5px solid #F0EEE8;color:#2C2C2A;'>"
+            f"<b>{html.escape(node['label'])}</b> <span style='color:#888780;'>({node['type']}, {node['platform']})</span> connects {connected} "
+            f"<span style='color:#5F5E5A;'>· {round(node['bridge_share'] * 100)}% of activity outside the main community · "
+            f"betweenness {node['betweenness']}</span></div>",
+            unsafe_allow_html=True
+        )
+
+    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+    st.markdown("**Most structurally important nodes**")
+    st.caption("PageRank rewards nodes connected to other well-connected nodes. It is a structural measure, not proof of real-world influence.")
+
+    def sentiment_word(score):
+        if score is None:
+            return "n/a"
+        if score >= 0.3:
+            return "mostly positive"
+        if score <= -0.3:
+            return "mostly negative"
+        return "mixed or neutral"
+
+    nc1, nc2 = st.columns(2)
+    for column, heading, nodes, bar_color in (
+        (nc1, "Participants", result["top_authors"], "#639922"),
+        (nc2, "Channels and videos", result["top_sources"], "#E24B4A"),
+    ):
+        with column:
+            st.markdown(f"**{heading}**")
+            max_rank = max([node["pagerank"] for node in nodes], default=0) or 1
+            for node in nodes:
+                bar_pct = round(node["pagerank"] / max_rank * 100)
+                st.markdown(
+                    f"<div style='margin-bottom:10px;'>"
+                    f"<div style='display:flex;justify-content:space-between;font-size:13px;margin-bottom:3px;'>"
+                    f"<span style='color:#2C2C2A;'>{html.escape(node['label'])}</span>"
+                    f"<span style='color:#5F5E5A;'>{node['connections']} connections · {node['messages']} messages</span></div>"
+                    f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
+                    f"<div style='width:{bar_pct}%;background:{bar_color};height:100%;'></div></div>"
+                    f"<div style='font-size:11px;color:#888780;margin-top:2px;'>{node['community_id'] or 'minor community'} · "
+                    f"{sentiment_word(node['sentiment_score'])}</div></div>",
+                    unsafe_allow_html=True
+                )
+
+    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+    st.markdown("**Topic propagation across communities**")
+    if not result["propagation"]:
+        st.info("No topic reached the minimum mentions in a community yet. Topic propagation needs enough messages and time history (see Topic Trends).")
+    spread_colors = {"high": "#D98A2B", "medium": "#3B8AD9", "contained": "#5F5E5A"}
+    for item in result["propagation"]:
+        steps = []
+        for position, step in enumerate(item["timeline"]):
+            timing = "first seen" if position == 0 else (f"+{step['lag_hours']}h" if step["lag_hours"] is not None else "")
+            steps.append(
+                f"<span style='color:{community_color(step['community_id'])};font-weight:600;'>{step['community_id']}</span> "
+                f"({step['mentions']} mentions, {timing})"
+            )
+        badge_color = spread_colors.get(item["spread"], "#5F5E5A")
+        st.markdown(
+            f"<div style='background:#fff;border-radius:14px;padding:14px 18px;border:0.5px solid #E5E2D9;margin-bottom:10px;'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;'>"
+            f"<span style='font-size:14px;font-weight:700;color:#2C2C2A;'>{html.escape(item['name'])}</span>"
+            f"<span style='background:{badge_color};color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;'>"
+            f"{item['spread'].upper()} SPREAD</span></div>"
+            f"<div style='font-size:12px;color:#5F5E5A;margin-bottom:6px;'>Reached {item['communities_reached']} of "
+            f"{item['total_communities']} communities · {item['total_mentions']} mentions</div>"
+            f"<div style='font-size:12px;color:#2C2C2A;line-height:1.8;'>{' → '.join(steps)}</div></div>",
+            unsafe_allow_html=True
+        )
+
+    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+    st.markdown("**Interactive Network Graph** — colors are communities, squares are channels or videos, thick border is a bridge node, size is PageRank")
+    html_file = generate_network_html(graph)
+    with open(html_file, "r", encoding="utf-8") as f:
+        graph_html = f.read()
+    st.components.v1.html(graph_html, height=620)
+
+
+PAGES = [
+    "Command Center",
+    "Live Search",
+    "Telegram Search",
+    "Sentiment",
+    "Trends",
+    "Audience",
+    "Network",
+    "PULSE Signals",
+]
+
+with st.sidebar:
+    st.title("PULSE")
+    st.caption("Live audience intelligence")
+    page = st.radio("Go to", PAGES, key="nav_page", label_visibility="collapsed")
+    st.divider()
+    st.caption(f"Signed in as {st.session_state.get('user_email', '')}")
+    if st.button("Log out", use_container_width=True):
         st.session_state.logged_in = False
         if hasattr(st, "user") and st.user.is_logged_in:
             st.logout()
         st.rerun()
 
 
-tab1, tab2 = st.tabs(["Live Sentiment (YouTube & News)", "Social Media Analytics (Telegram)"])
+SIGNAL_PRIORITY_COLORS = {"high": "#A32D2D", "medium": "#D98A2B", "low": "#5F5E5A"}
+VECTOR_LABELS = {"trend": "Trend", "sentiment": "Sentiment", "audience": "Audience", "network": "Network"}
 
-with tab1:
+
+def render_signal_card(signal, key_prefix):
+    color = SIGNAL_PRIORITY_COLORS.get(signal["priority"], "#5F5E5A")
+    terms = "".join(
+        f"<span style='display:inline-block;background:#F0EEE8;color:#2C2C2A;padding:3px 10px;border-radius:14px;"
+        f"font-size:12px;margin:0 6px 6px 0;'>{html.escape(term)}</span>"
+        for term in signal["terms"]
+    )
+    rows = [
+        ("WHAT", signal["what"]),
+        ("WHO", signal["who"]),
+        ("HOW THEY FEEL", signal["how_they_feel"]),
+        ("HOW IT SPREADS", signal["how_it_spreads"]),
+        ("HOW FAST", signal["how_fast"]),
+        ("WHY IT MATTERS", signal["why_it_matters"]),
+    ]
+    rows_html = "".join(
+        f"<div style='margin-bottom:8px;'><div style='font-size:10px;font-weight:700;color:#888780;letter-spacing:0.06em;'>{label}</div>"
+        f"<div style='font-size:13px;color:#2C2C2A;line-height:1.5;'>{html.escape(str(value))}</div></div>"
+        for label, value in rows
+    )
+    st.markdown(
+        f"<div style='background:#fff;border-radius:14px;padding:18px 20px;border:0.5px solid #E5E2D9;"
+        f"box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:12px;border-left:4px solid {color};'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;'>"
+        f"<span style='font-size:15px;font-weight:700;color:#2C2C2A;'>{html.escape(signal['topic'])}</span>"
+        f"<span><span style='background:#F0EEE8;color:#2C2C2A;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;margin-right:6px;'>"
+        f"{signal['type'].upper()}</span>"
+        f"<span style='background:{color};color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;'>"
+        f"{signal['priority'].upper()}</span></span></div>"
+        f"<div style='margin-bottom:8px;'>{terms}</div>"
+        f"<div style='display:flex;gap:28px;margin-bottom:12px;'>"
+        f"<div><div style='font-size:11px;color:#888780;'>Signal score</div>"
+        f"<div style='font-size:20px;font-weight:700;color:{color};'>{signal['score']:.0f}<span style='font-size:12px;color:#888780;'> / 100</span></div></div>"
+        f"<div><div style='font-size:11px;color:#888780;'>Confidence proxy</div>"
+        f"<div style='font-size:20px;font-weight:700;color:#2C2C2A;'>{round(signal['confidence_proxy'] * 100)}%</div></div></div>"
+        f"{rows_html}</div>",
+        unsafe_allow_html=True
+    )
+
+    explanation_key = f"explanation_{signal['signal_id']}"
+    if st.button("Explain this signal", key=f"explain_btn_{key_prefix}"):
+        with st.spinner("Writing an explanation from the detected evidence..."):
+            st.session_state[explanation_key] = explain_signal(signal, llm=generate_gemini_summary)
+    if explanation_key in st.session_state:
+        explanation = st.session_state[explanation_key]
+        if explanation["source"] == "gemini":
+            source_note = "Written by Gemini from the detected evidence only; numbers were checked against the evidence."
+        else:
+            reasons = {
+                "llm_unavailable": "Gemini was unavailable",
+                "ungrounded_numbers": "the Gemini text contained numbers not in the evidence",
+                "too_long": "the Gemini text was too long",
+                "empty": "Gemini returned nothing",
+                "no_llm": "no Gemini key is configured",
+            }
+            source_note = f"Built directly from the detected evidence ({reasons.get(explanation['reason'], explanation['reason'])})."
+        st.markdown(
+            f"<div style='background:#F7F5EF;border-radius:10px;padding:12px 14px;font-size:13px;color:#2C2C2A;line-height:1.6;margin-bottom:6px;'>"
+            f"{html.escape(explanation['text'])}</div>",
+            unsafe_allow_html=True
+        )
+        st.caption(source_note)
+        with st.expander("Evidence given to the explainer"):
+            st.code(explanation["facts"], language=None)
+
+    with st.expander("Score breakdown and evidence"):
+        breakdown = []
+        for name in ("trend", "sentiment", "audience", "network"):
+            value = signal["components"].get(name)
+            if value is None:
+                breakdown.append(f"- **{VECTOR_LABELS[name]}**: not available")
+            else:
+                weight = signal["weights_used"].get(name, 0)
+                mark = " (corroborating)" if name in signal["corroborating_vectors"] else ""
+                breakdown.append(f"- **{VECTOR_LABELS[name]}**: {value:.2f} × weight {weight:.2f}{mark}")
+        st.markdown("\n".join(breakdown))
+        st.caption(
+            "The score is a weighted heuristic over the available vectors, renormalized when a vector is missing. "
+            "The weights are documented baseline choices and have not been validated. The confidence proxy reflects data volume, "
+            "vector availability and corroboration; it is not a calibrated probability."
+        )
+        for text in signal.get("sample_texts", []):
+            st.markdown(
+                f"<div style='padding:6px 0;border-bottom:0.5px solid #F0EEE8;font-size:13px;color:#2C2C2A;'>{html.escape(text)}</div>",
+                unsafe_allow_html=True
+            )
+
+
+def render_pulse_signals(result):
+    if result["status"] == "insufficient_data":
+        st.warning(
+            f"Not enough data to detect signals. Found {result['usable_events']} usable messages, "
+            f"at least {result['min_required']} are needed. Run more searches first."
+        )
+        return
+    if result["status"] == "insufficient_history":
+        st.warning("All collected messages fall within a very short time span, so growth can't be measured yet. Collect data over a longer period.")
+        return
+
+    vectors = result["vectors"]
+    st.markdown(
+        f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 4px 0;'>{result['total_events']} messages · "
+        f"latest {result['window_hours']:g}h window · {len(result['signals'])} signals</p>",
+        unsafe_allow_html=True
+    )
+    st.caption(
+        f"Vector status: trends {vectors['trends']}, audience {vectors['audience']}, network {vectors['network']}. "
+        "Sentiment is read from analyzed messages. A signal needs an Emerging or Rising topic with a score of at least 25."
+    )
+    if not result["signals"]:
+        st.info("No Emerging or Rising topic reached the signal threshold in this window.")
+        return
+    for position, signal in enumerate(result["signals"]):
+        render_signal_card(signal, key_prefix=f"signal_{position}")
+
+
+def render_saved_signals(signals):
+    if not signals:
+        st.info("No saved signals yet.")
+        return
+    for position, signal in enumerate(signals):
+        render_signal_card(signal, key_prefix=f"saved_{position}")
+        st.caption(f"First saved {signal.get('created_at', 'unknown')} · last updated {signal.get('updated_at', 'unknown')}")
+
+
+SENTIMENT_COLORS = ["#3B6D11", "#888780", "#A32D2D"]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_intelligence():
+    events = fetch_events(limit=20000)
+    return events, run_pipeline(events)
+
+
+def kpi_card(label, value, note="", accent="#3B6D11"):
+    st.markdown(
+        f"<div style='background:#fff;border-radius:14px;padding:16px 18px;border:0.5px solid #E5E2D9;"
+        f"border-top:3px solid {accent};box-shadow:0 1px 3px rgba(44,44,42,0.05);min-height:104px;'>"
+        f"<div style='font-size:11px;color:#888780;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;'>{html.escape(label)}</div>"
+        f"<div style='font-size:30px;font-weight:800;color:#2C2C2A;margin-top:4px;line-height:1.1;'>{value}</div>"
+        f"<div style='font-size:12px;color:#888780;margin-top:6px;'>{html.escape(note)}</div></div>",
+        unsafe_allow_html=True
+    )
+
+
+def sentiment_frame(counts_by_label):
+    return pd.DataFrame(
+        {"Sentiment": ["Positive", "Neutral", "Negative"], "Messages": [counts_by_label["Positive"], counts_by_label["Neutral"], counts_by_label["Negative"]]}
+    ).set_index("Sentiment")
+
+
+def render_command_center():
+    st.markdown(
+        "<div style='margin-bottom:6px;'><div style='font-size:26px;font-weight:800;letter-spacing:2px;color:#2C2C2A;'>PULSE</div>"
+        "<div style='font-size:12px;font-weight:600;letter-spacing:3px;color:#888780;'>LIVE AUDIENCE INTELLIGENCE</div></div>",
+        unsafe_allow_html=True
+    )
+    if st.button("Refresh intelligence", key="cc_refresh_btn"):
+        load_intelligence.clear()
+
+    try:
+        events, pipeline = load_intelligence()
+    except Exception as e:
+        st.error(f"Couldn't load collected data: {e}")
+        return
+
+    summary = command_center_summary(events, pipeline)
+    if summary["total_events"] == 0:
+        st.info("No collected data yet. Use the search pages to collect messages first.")
+        return
+
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        kpi_card("Total Events", f"{summary['total_events']:,}", f"{summary['analyzed_events']:,} analyzed for sentiment", "#3B6D11")
+    with kpi2:
+        kpi_card("Active Topics", summary["active_topics"], "topics above the minimum volume", "#185FA5")
+    with kpi3:
+        kpi_card("Audience Segments", summary["segments"], "observable, not demographic", "#7F5AA2")
+    with kpi4:
+        kpi_card("Emerging Signals", summary["emerging_signals"], f"{summary['rising_signals']} more rising", "#BA7517")
+
+    if summary["pipeline_status"] != "ok":
+        st.warning("Topic trends need more data over a longer period before signals can be detected.")
+
+    st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
+    st.markdown("#### Top Signals")
+    if not summary["top_signals"]:
+        st.caption("No Emerging or Rising topic has reached the signal threshold yet.")
+    for signal in summary["top_signals"]:
+        color = SIGNAL_PRIORITY_COLORS.get(signal["priority"], "#5F5E5A")
+        st.markdown(
+            f"<div style='background:#fff;border-radius:12px;padding:14px 18px;border:0.5px solid #E5E2D9;"
+            f"border-left:4px solid {color};margin-bottom:8px;'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
+            f"<span style='font-size:14px;font-weight:700;color:#2C2C2A;'>{html.escape(signal['topic'])}</span>"
+            f"<span style='font-size:12px;color:#5F5E5A;'>{signal['type'].upper()} · "
+            f"<b style='color:{color};'>{signal['priority'].upper()}</b> · score {signal['score']:.0f}</span></div>"
+            f"<div style='font-size:12px;color:#5F5E5A;margin-top:4px;'>{html.escape(signal['why_it_matters'])}</div></div>",
+            unsafe_allow_html=True
+        )
+    if summary["top_signals"]:
+        st.caption("Open the PULSE Signals page for the full evidence and explanation.")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Trend Velocity")
+        if summary["velocity"]:
+            velocity_frame = pd.DataFrame(summary["velocity"]).set_index("topic")[["velocity_per_hour"]]
+            velocity_frame.columns = ["Messages per hour change"]
+            st.bar_chart(velocity_frame, horizontal=True)
+            st.caption("Change in messages per hour, latest window versus the one before it.")
+        else:
+            st.caption("Not enough history to measure velocity yet.")
+    with right:
+        st.markdown("#### Sentiment Overview")
+        overview = sentiment_overview(events)
+        if overview["analyzed_events"]:
+            st.bar_chart(sentiment_frame(overview["distribution"]), horizontal=True, color=["#5F5E5A"])
+            st.caption(f"{overview['analyzed_events']:,} of {overview['total_events']:,} messages have been analyzed.")
+        else:
+            st.caption("No analyzed messages yet. Run analyze_pending.py to analyze stored events.")
+
+    vectors = summary["vectors"]
+    if vectors:
+        st.caption(f"Vector status: trends {vectors.get('trends')}, audience {vectors.get('audience')}, network {vectors.get('network')}.")
+
+    st.markdown("#### Processing Workers")
+    try:
+        workers = worker_summary(fetch_worker_status())
+    except Exception:
+        workers = None
+    if workers is None:
+        st.caption("Worker status could not be loaded.")
+    elif not workers:
+        st.caption("No processing worker has reported yet. Start one with: python workers/run_worker.py")
+    else:
+        for row in workers:
+            state = "running" if row["alive"] else "not reporting"
+            age = "never" if row["heartbeat_age_seconds"] is None else f"{row['heartbeat_age_seconds']}s ago"
+            lag = "unknown" if row["consumer_lag"] is None else row["consumer_lag"]
+            p95 = "n/a" if row["batch_seconds_p95"] is None else f"{row['batch_seconds_p95']}s"
+            st.caption(
+                f"{row['worker_id']}: {state} (last heartbeat {age}) · stored {row['stored']} · analyzed {row['analyzed']} · "
+                f"malformed {row['malformed']} · analysis failures {row['analysis_failures']} · lag {lag} · batch P95 {p95}"
+            )
+
+
+def render_sentiment_page():
+    st.markdown("#### Sentiment Analytics")
+    st.caption("Built from stored, analyzed messages across every platform. Emotion and sarcasm are only evaluated for English text.")
+    try:
+        events, _ = load_intelligence()
+    except Exception as e:
+        st.error(f"Couldn't load collected data: {e}")
+        return
+
+    overview = sentiment_overview(events)
+    if not overview["analyzed_events"]:
+        st.info("No analyzed messages yet. Run analyze_pending.py to analyze stored events.")
+        return
+
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    shares = overview["shares"]
+    with metric1:
+        kpi_card("Positive", f"{round(shares['Positive'] * 100)}%", f"{overview['distribution']['Positive']:,} messages", "#3B6D11")
+    with metric2:
+        kpi_card("Neutral", f"{round(shares['Neutral'] * 100)}%", f"{overview['distribution']['Neutral']:,} messages", "#B4B2A9")
+    with metric3:
+        kpi_card("Negative", f"{round(shares['Negative'] * 100)}%", f"{overview['distribution']['Negative']:,} messages", "#A32D2D")
+    with metric4:
+        sarcasm = overview["sarcasm"]
+        if sarcasm["evaluated"]:
+            kpi_card("Sarcasm Flagged", f"{round(sarcasm['share'] * 100)}%", f"of {sarcasm['evaluated']:,} English messages checked")
+        else:
+            kpi_card("Sarcasm Flagged", "n/a", "no English messages checked")
+
+    st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
+    st.markdown("#### Sentiment Over Time")
+    timeline = pd.DataFrame(overview["timeline"])
+    if len(timeline) >= 2:
+        timeline["bucket"] = pd.to_datetime(timeline["bucket"])
+        st.bar_chart(timeline.set_index("bucket")[["Positive", "Neutral", "Negative"]], color=SENTIMENT_COLORS)
+        st.caption(f"Messages per {overview['timeline_unit']}, split by sentiment.")
+    else:
+        st.caption("All analyzed messages fall into a single time bucket, so a timeline can't be drawn yet.")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Platform Comparison")
+        platform_rows = {
+            name: {label: round(values["shares"][label] * 100, 1) for label in ("Positive", "Neutral", "Negative")}
+            for name, values in overview["by_platform"].items()
+        }
+        st.bar_chart(pd.DataFrame(platform_rows).T, horizontal=True, color=SENTIMENT_COLORS)
+        st.caption("Share of each platform's analyzed messages, in percent. " + ", ".join(
+            f"{name}: {values['total']:,}" for name, values in overview["by_platform"].items()
+        ))
+    with right:
+        st.markdown("#### Language Comparison")
+        if overview["by_language"]:
+            language_rows = {
+                row["language"]: {label: round(row["shares"][label] * 100, 1) for label in ("Positive", "Neutral", "Negative")}
+                for row in overview["by_language"]
+            }
+            st.bar_chart(pd.DataFrame(language_rows).T, horizontal=True, color=SENTIMENT_COLORS)
+            st.caption("Languages with at least 5 analyzed messages, in percent. " + ", ".join(
+                f"{row['language']}: {row['total']:,}" for row in overview["by_language"]
+            ))
+        else:
+            st.caption("No language has enough analyzed messages for a comparison yet.")
+
+    st.markdown("#### Emotions")
+    if overview["emotions"]:
+        emotion_frame = pd.DataFrame(overview["emotions"]).set_index("emotion")
+        st.bar_chart(emotion_frame, horizontal=True, color=["#5F5E5A"])
+        st.caption("Emotion is classified only for English messages.")
+    else:
+        st.caption("No emotion data stored. Run analyze_pending.py without skipping emotion to fill it in.")
+
+
+if page == "Command Center":
+    render_command_center()
+
+if page == "Sentiment":
+    render_sentiment_page()
+
+if page == "Live Search":
     if "keyword_input" not in st.session_state:
         st.session_state["keyword_input"] = ""
 
@@ -1339,7 +1711,7 @@ with tab1:
     elif not compare_mode and "last_result" not in st.session_state:
         st.info("Enter a keyword above and click Analyze to see live sentiment.")
 
-with tab2:
+if page == "Telegram Search":
     st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
 
     st.markdown("#### Search Telegram")
@@ -1428,141 +1800,143 @@ with tab2:
                     st.markdown(f"<span style='color:{color};font-weight:600;font-size:12px;'>{m['sentiment'].upper()}</span> {m['text'][:150]}", unsafe_allow_html=True)
                 st.markdown("---")
 
-    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
-    st.markdown("#### Trend Detection")
-    st.caption("Analyzes all data collected so far across YouTube, News, and Telegram")
 
-    if st.button("Detect Trends", key="detect_trends_btn"):
-        with st.spinner("Analyzing trends across all collected data (YouTube, News, Telegram combined)..."):
-            all_docs = extract_all_documents()
-            st.session_state["trend_results"] = detect_trends(all_docs) if all_docs else None
+if page == "Trends":
+    st.markdown("#### Topic Trends")
+    st.caption("Groups collected messages into topics and tracks how fast each topic is growing or fading, including how its sentiment changes")
+
+    trend_col1, trend_col2 = st.columns([4, 1])
+    with trend_col1:
+        trend_keyword = st.text_input(
+            "Trend keyword",
+            placeholder="Optional: limit to one keyword, or leave empty to use all collected data",
+            label_visibility="collapsed",
+            key="trend_keyword_input"
+        )
+    with trend_col2:
+        trend_clicked = st.button("Detect Trends", use_container_width=True, type="primary", key="detect_trends_btn")
+
+    if trend_clicked:
+        with st.spinner("Detecting topics and measuring their growth..."):
+            try:
+                trend_events = fetch_events(keyword=trend_keyword.strip() or None, limit=20000)
+                st.session_state["trend_results"] = detect_topic_trends(trend_events)
+            except Exception as e:
+                st.session_state.pop("trend_results", None)
+                st.error(f"Couldn't detect topic trends: {e}")
 
     if "trend_results" in st.session_state:
-        trend_results = st.session_state["trend_results"]
-        if trend_results is None:
-            st.warning("No data found yet. Run some searches first to collect data.")
-        else:
-            st.caption("Left: words mentioned most often overall. Right: words whose mentions grew fastest in the last 24 hours compared to the previous 24 hours.")
-            tr1, tr2 = st.columns(2)
-            with tr1:
-                st.markdown("**Most Mentioned (all-time)**")
-                mentions = trend_results["most_mentioned_overall"]
-                max_count = max([c for _, c in mentions], default=1)
-                for word, count in mentions:
-                    bar_pct = round(count / max_count * 100)
-                    st.markdown(
-                        f"<div style='margin-bottom:8px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
-                        f"<span style='color:#2C2C2A;'>{word}</span><span style='color:#5F5E5A;'>{count}</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
-                        f"<div style='width:{bar_pct}%;background:#639922;height:100%;'></div></div></div>",
-                        unsafe_allow_html=True
-                    )
-            with tr2:
-                st.markdown("**Trending Now (last 24h growth)**")
-                trending = trend_results["trending_now"]
-                max_growth = max([max(g, 1) for _, _, _, g in trending], default=1)
-                for word, recent, older, growth in trending:
-                    bar_pct = round(max(growth, 0) / max_growth * 100)
-                    growth_color = "#639922" if growth >= 0 else "#A32D2D"
-                    st.markdown(
-                        f"<div style='margin-bottom:8px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;'>"
-                        f"<span style='color:#2C2C2A;'>{word}</span><span style='color:{growth_color};'>{growth:+d}</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
-                        f"<div style='width:{bar_pct}%;background:{growth_color};height:100%;'></div></div></div>",
-                        unsafe_allow_html=True
-                    )
+        render_topic_trends(st.session_state["trend_results"])
 
-    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
-    st.markdown("#### Demographics (Aggregate, Anonymized)")
-    st.caption("Language and interest-category distribution across all collected data")
 
-    if st.button("Analyze Demographics", key="analyze_demo_btn"):
-        with st.spinner("Detecting languages and interest categories..."):
-            all_docs = extract_all_documents()
-            st.session_state["demo_results"] = analyze_demographics(all_docs)
+if page == "Audience":
+    st.markdown("#### Audience Intelligence & Segmentation")
+    st.caption("Observable audience segments built from what people write: topics, language, engagement and sentiment. No age or gender is inferred.")
 
-    if "demo_results" in st.session_state:
-        demo_results = st.session_state["demo_results"]
-        if demo_results["total_documents_analyzed"] == 0:
-            st.warning("No data found yet. Run some searches first to collect data.")
-        else:
-            dc1, dc2 = st.columns(2)
-            with dc1:
-                st.markdown("**Language Distribution**")
-                for lang, stats in demo_results["language_distribution"].items():
-                    st.markdown(
-                        f"<div style='margin-bottom:10px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;'>"
-                        f"<span style='color:#2C2C2A;'>{lang}</span><span style='color:#5F5E5A;'>{stats['percent']}% of messages</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:10px;overflow:hidden;'>"
-                        f"<div style='width:{stats['percent']}%;background:#3B8AD9;height:100%;'></div></div></div>",
-                        unsafe_allow_html=True
-                    )
-            with dc2:
-                st.markdown("**Interest Categories**")
-                interests = demo_results["interest_distribution"]
-                max_mentions = max(interests.values(), default=1)
-                for category, count in interests.items():
-                    bar_pct = round(count / max_mentions * 100)
-                    st.markdown(
-                        f"<div style='margin-bottom:10px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;'>"
-                        f"<span style='color:#2C2C2A;'>{category}</span><span style='color:#5F5E5A;'>{count} mentions</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:10px;overflow:hidden;'>"
-                        f"<div style='width:{bar_pct}%;background:#B15FC9;height:100%;'></div></div></div>",
-                        unsafe_allow_html=True
-                    )
+    seg_col1, seg_col2 = st.columns([4, 1])
+    with seg_col1:
+        segment_keyword = st.text_input(
+            "Segment keyword",
+            placeholder="Optional: limit to one keyword, or leave empty to use all collected data",
+            label_visibility="collapsed",
+            key="segment_keyword_input"
+        )
+    with seg_col2:
+        segment_clicked = st.button("Build Segments", use_container_width=True, type="primary", key="build_segments_btn")
 
-    st.markdown("<div style='height:24px;'></div>", unsafe_allow_html=True)
+    if segment_clicked:
+        with st.spinner("Grouping collected messages into audience segments..."):
+            try:
+                segment_events = fetch_events(keyword=segment_keyword.strip() or None, limit=20000)
+                st.session_state["audience_result"] = build_audience_segments(segment_events)
+            except Exception as e:
+                st.session_state.pop("audience_result", None)
+                st.error(f"Couldn't build audience segments: {e}")
+
+    if "audience_result" in st.session_state:
+        render_audience_segments(st.session_state["audience_result"])
+
+
+if page == "Network":
     st.markdown("#### Link & Network Analysis")
-    st.caption("Based on Telegram data — maps users to the channels they post in")
+    st.caption("Maps participants and the channels or videos they post in, then finds communities, bridge nodes and how topics spread between communities")
 
-    if st.button("Build Network Graph", key="build_network_btn"):
-        with st.spinner("Building network graph..."):
-            st.session_state["network_graph"] = build_network_graph()
+    network_col1, network_col2 = st.columns([4, 1])
+    with network_col1:
+        network_keyword = st.text_input(
+            "Network keyword",
+            placeholder="Optional: limit to one keyword, or leave empty to use all collected data",
+            label_visibility="collapsed",
+            key="network_keyword_input"
+        )
+    with network_col2:
+        network_clicked = st.button("Build Network", use_container_width=True, type="primary", key="build_network_btn")
 
-    if "network_graph" in st.session_state:
-        G = st.session_state["network_graph"]
-        if G.number_of_nodes() == 0:
-            st.warning("No Telegram data found yet. Search Telegram above first to collect data.")
-        else:
-            top_users, top_channels = compute_network_influence(G)
+    if network_clicked:
+        with st.spinner("Building the network and measuring how topics spread..."):
+            try:
+                network_events = fetch_events(keyword=network_keyword.strip() or None, limit=20000)
+                network_trends = detect_topic_trends(network_events)
+                network_topics = network_trends["topics"] if network_trends["status"] == "ok" else None
+                network_result, network_graph = analyze_network(network_events, network_topics)
+                st.session_state["network_result"] = network_result
+                st.session_state["network_graph_obj"] = network_graph
+            except Exception as e:
+                st.session_state.pop("network_result", None)
+                st.session_state.pop("network_graph_obj", None)
+                st.error(f"Couldn't build the network: {e}")
 
-            nc1, nc2 = st.columns(2)
-            with nc1:
-                st.markdown("**Top Influential Users**")
-                st.caption("Users active across the most different channels")
-                max_user_score = max([s for _, s in top_users], default=1)
-                for user, score in top_users:
-                    bar_pct = round(score / max_user_score * 100)
-                    st.markdown(
-                        f"<div style='margin-bottom:10px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;'>"
-                        f"<span style='color:#2C2C2A;'>{user}</span><span style='color:#5F5E5A;'>active in {score} channel(s)</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:10px;overflow:hidden;'>"
-                        f"<div style='width:{bar_pct}%;background:#639922;height:100%;'></div></div></div>",
-                        unsafe_allow_html=True
+    if "network_result" in st.session_state:
+        render_network_intelligence(st.session_state["network_result"], st.session_state["network_graph_obj"])
+
+
+if page == "PULSE Signals":
+    st.markdown("#### PULSE Signals")
+    st.caption("Fuses trend, sentiment, audience and network evidence into explainable signals about conversations that are emerging or rising")
+
+    signal_col1, signal_col2 = st.columns([4, 1])
+    with signal_col1:
+        signal_keyword = st.text_input(
+            "Signal keyword",
+            placeholder="Optional: limit to one keyword, or leave empty to use all collected data",
+            label_visibility="collapsed",
+            key="signal_keyword_input"
+        )
+    with signal_col2:
+        signal_clicked = st.button("Detect Signals", use_container_width=True, type="primary", key="detect_signals_btn")
+
+    if signal_clicked:
+        with st.spinner("Running trend, audience and network analysis and fusing the evidence..."):
+            try:
+                signal_events = fetch_events(keyword=signal_keyword.strip() or None, limit=20000)
+                st.session_state["signal_result"] = run_pipeline(signal_events)
+                st.session_state.pop("signal_save_message", None)
+            except Exception as e:
+                st.session_state.pop("signal_result", None)
+                st.error(f"Couldn't detect signals: {e}")
+
+    if "signal_result" in st.session_state:
+        current_signals = st.session_state["signal_result"]["signals"]
+        if current_signals:
+            if st.button("Save these signals", key="save_signals_btn"):
+                try:
+                    summary = save_signals(current_signals)
+                    st.session_state["signal_save_message"] = (
+                        f"Saved {summary['inserted']} new and updated {summary['updated']} existing signals."
                     )
-            with nc2:
-                st.markdown("**Top Channels by Reach**")
-                st.caption("Channels with the most distinct participants")
-                max_channel_score = max([s for _, s in top_channels], default=1)
-                for channel, score in top_channels:
-                    bar_pct = round(score / max_channel_score * 100)
-                    st.markdown(
-                        f"<div style='margin-bottom:10px;'>"
-                        f"<div style='display:flex;justify-content:space-between;font-size:14px;margin-bottom:4px;'>"
-                        f"<span style='color:#2C2C2A;'>{channel}</span><span style='color:#5F5E5A;'>{score} user(s)</span></div>"
-                        f"<div style='background:#F0EEE8;border-radius:5px;height:10px;overflow:hidden;'>"
-                        f"<div style='width:{bar_pct}%;background:#E24B4A;height:100%;'></div></div></div>",
-                        unsafe_allow_html=True
-                    )
+                except Exception as e:
+                    st.session_state["signal_save_message"] = f"Couldn't save signals: {e}"
+        if "signal_save_message" in st.session_state:
+            st.info(st.session_state["signal_save_message"])
+        render_pulse_signals(st.session_state["signal_result"])
 
-            st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
-            st.markdown("**Interactive Network Graph** — drag nodes, scroll to zoom", unsafe_allow_html=True)
-            html_file = generate_network_html(G)
-            with open(html_file, "r", encoding="utf-8") as f:
-                graph_html = f.read()
-            st.components.v1.html(graph_html, height=620)
+    st.markdown("---")
+    with st.expander("Saved signals history"):
+        if st.button("Load saved signals", key="load_signals_btn"):
+            try:
+                st.session_state["saved_signals"] = fetch_signals(limit=20)
+            except Exception as e:
+                st.session_state.pop("saved_signals", None)
+                st.error(f"Couldn't load saved signals: {e}")
+        if "saved_signals" in st.session_state:
+            render_saved_signals(st.session_state["saved_signals"])
