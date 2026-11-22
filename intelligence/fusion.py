@@ -216,6 +216,9 @@ def fuse_topic(topic, events_by_id, audience_result, segment_index, network_resu
         },
         "keywords": topic.get("keywords", []),
         "sample_texts": topic.get("sample_texts", []),
+        "sample_platforms": topic.get("sample_platforms", []),
+        "duplicate_share": topic.get("duplicate_share", 0.0),
+        "platform_mix": dict(Counter(member.get("platform") for member in members if member.get("platform"))),
     }
 
 

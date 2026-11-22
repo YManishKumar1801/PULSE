@@ -7,6 +7,7 @@ from telethon.sync import TelegramClient
 from pyvis.network import Network as PyvisNetwork
 from datetime import datetime, timezone
 import html
+import re
 import requests
 import json
 import uuid
@@ -22,10 +23,19 @@ from ingestion.sources import SourceError, fetch_news, fetch_telegram_messages, 
 from intelligence.explain import explain_signal
 from intelligence.gemini_client import generate_text
 from intelligence.network import analyze_network
-from intelligence.overview import command_center_summary, sentiment_overview, worker_summary
+from intelligence.overview import TIMELINE_RANGES, audience_overview, command_center_summary, network_overview, signal_card, signals_csv, signals_overview, sentiment_overview, timeline_window, trends_overview, worker_summary
 from intelligence.sentiment import analyze_events, analyze_text
 from intelligence.signals import run_pipeline
 from intelligence.trends import detect_topic_trends
+from ui_sentiment import (
+    mood_bar_html,
+    compare_summary_html,
+    language_name,
+    overall_headline,
+    ranked_bars_html,
+    single_summary_html,
+    stacked_bars_html,
+)
 from storage.mongodb import fetch_events, fetch_signals, fetch_worker_status, save_analyses, save_events, save_signals
 
 load_dotenv()
@@ -43,7 +53,7 @@ KAFKA_TOPIC = "pulse-youtube"
 FIREBASE_SIGNIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
 FIREBASE_SIGNUP_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={FIREBASE_API_KEY}"
 
-st.set_page_config(page_title="PULSE - Live Audience Intelligence", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="PULSE - Live Audience Intelligence", page_icon="📡", layout="wide", initial_sidebar_state="expanded")
 
 class PulseError(Exception):
     pass
@@ -155,6 +165,56 @@ div[data-testid="stExpander"] summary {
     color: #3B6D11 !important;
     font-weight: 600;
 }
+
+section[data-testid="stSidebar"] { border-right: 1px solid #E5E2D9; }
+section[data-testid="stSidebar"] h1, section[data-testid="stSidebar"] h1 * {
+    color: #3B6D11 !important; font-weight: 800; letter-spacing: 3px; font-size: 1.9rem;
+}
+section[data-testid="stSidebar"] div[role="radiogroup"] { gap: 2px; }
+section[data-testid="stSidebar"] div[role="radiogroup"] label {
+    padding: 8px 12px; border-radius: 10px; width: 100%;
+}
+section[data-testid="stSidebar"] div[role="radiogroup"] label:hover { background: #E8E5DA; }
+section[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) {
+    background: #E1EDD2; font-weight: 600;
+}
+
+div[data-testid="stMetricValue"] { font-weight: 800; }
+div[data-testid="stMetricLabel"] p { color: #5F5E5A !important; font-weight: 600; }
+
+h2, h3 { letter-spacing: -0.2px; }
+h3 { color: #2A4D0C !important; margin-top: 1.2rem; }
+
+.st-key-hero {
+    background: linear-gradient(135deg, #EAF3DE 0%, #F7F4EA 100%);
+    border: 1px solid #D9E6C6; border-radius: 16px; padding: 18px 24px;
+}
+.st-key-hero h2 { color: #2A4D0C !important; }
+
+[class*="st-key-kpi_"] { border-radius: 14px; border-top-width: 4px; box-shadow: 0 1px 3px rgba(44,44,42,0.05); }
+.st-key-kpi_green { background: #F2F8EA; border-top-color: #3B6D11; }
+.st-key-kpi_blue { background: #EDF4FB; border-top-color: #378ADD; }
+.st-key-kpi_amber { background: #FDF5E6; border-top-color: #D98A2B; }
+.st-key-kpi_purple { background: #F4EFF9; border-top-color: #7F5AA2; }
+.st-key-kpi_grey { background: #F5F4F0; border-top-color: #B4B2A9; }
+.st-key-kpi_red { background: #FEF4F3; border-top-color: #E24B4A; }
+
+[class*="st-key-sig_"] { border-radius: 14px; border-left-width: 5px; box-shadow: 0 1px 3px rgba(44,44,42,0.05); }
+[class*="st-key-sig_high"] { background: #FEF6F5; border-left-color: #C0392B; }
+[class*="st-key-sig_medium"] { background: #FEF9EE; border-left-color: #D98A2B; }
+[class*="st-key-sig_low"] { background: #F7F6F2; border-left-color: #888780; }
+
+[class*="st-key-mood_"] { border-radius: 14px; box-shadow: 0 1px 3px rgba(44,44,42,0.05); }
+[class*="st-key-mood_pos"] { background: #F2F8EA; border-color: #CFE0B8; }
+[class*="st-key-mood_neu"] { background: #F5F4F0; border-color: #DEDBD0; }
+[class*="st-key-mood_neg"] { background: #FEF4F3; border-color: #F0CBC7; }
+
+[class*="st-key-trend_"] { border-radius: 14px; border-left-width: 5px; box-shadow: 0 1px 3px rgba(44,44,42,0.05); }
+[class*="st-key-trend_amber"] { background: #FEF9EE; border-left-color: #D98A2B; }
+[class*="st-key-trend_green"] { background: #F2F8EA; border-left-color: #3B6D11; }
+[class*="st-key-trend_blue"] { background: #EDF4FB; border-left-color: #378ADD; }
+[class*="st-key-trend_grey"] { background: #F7F6F2; border-left-color: #888780; }
+[class*="st-key-trend_red"] { background: #FEF4F3; border-left-color: #C0392B; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -729,7 +789,7 @@ def analyze_keyword(keyword):
 
 
 
-def render_result(result, key_prefix):
+def render_result(result, key_prefix, show_summary=True):
     counts = result["counts"]
     total = result["total"]
 
@@ -737,58 +797,10 @@ def render_result(result, key_prefix):
     st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
     st.markdown(f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 20px 0;'>{total} data points · {len(result['videos'])} YouTube videos · {len(result['news_articles'])} news articles</p>", unsafe_allow_html=True)
 
-    pos_pct = round(counts["Positive"] / total * 100) if total else 0
-    neu_pct = round(counts["Neutral"] / total * 100) if total else 0
-    neg_pct = round(counts["Negative"] / total * 100) if total else 0
-
-    radius = 58
-    circumference = 2 * 3.14159265 * radius
-
-    def donut_segment(percent, offset_percent):
-        length = circumference * percent / 100
-        dash = f"{length:.2f} {circumference - length:.2f}"
-        dashoffset = -(circumference * offset_percent / 100)
-        return dash, dashoffset
-
-    pos_dash, pos_offset = donut_segment(pos_pct, 0)
-    neu_dash, neu_offset = donut_segment(neu_pct, pos_pct)
-    neg_dash, neg_offset = donut_segment(neg_pct, pos_pct + neu_pct)
-
-    dominant_pct = max(pos_pct, neu_pct, neg_pct)
-    dominant_label = "positive" if pos_pct == dominant_pct else "negative" if neg_pct == dominant_pct else "neutral"
-    dominant_color = "#3B6D11" if dominant_label == "positive" else "#A32D2D" if dominant_label == "negative" else "#5F5E5A"
-
-    st.markdown(f"""
-    <div style="background:#fff;border-radius:14px;padding:22px;border:0.5px solid #E5E2D9;box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:16px;display:grid;grid-template-columns:180px 1fr;gap:24px;align-items:center;">
-        <div style="display:flex;justify-content:center;">
-            <svg width="140" height="140" viewBox="0 0 140 140">
-                <circle cx="70" cy="70" r="{radius}" fill="none" stroke="#F0EEE8" stroke-width="16"/>
-                <circle cx="70" cy="70" r="{radius}" fill="none" stroke="#639922" stroke-width="16" stroke-dasharray="{pos_dash}" stroke-dashoffset="{pos_offset}" transform="rotate(-90 70 70)"/>
-                <circle cx="70" cy="70" r="{radius}" fill="none" stroke="#B4B2A9" stroke-width="16" stroke-dasharray="{neu_dash}" stroke-dashoffset="{neu_offset}" transform="rotate(-90 70 70)"/>
-                <circle cx="70" cy="70" r="{radius}" fill="none" stroke="#E24B4A" stroke-width="16" stroke-dasharray="{neg_dash}" stroke-dashoffset="{neg_offset}" transform="rotate(-90 70 70)"/>
-                <text x="70" y="65" text-anchor="middle" font-size="26" font-weight="700" fill="{dominant_color}">{dominant_pct}%</text>
-                <text x="70" y="85" text-anchor="middle" font-size="11" fill="#5F5E5A">{dominant_label}</text>
-            </svg>
-        </div>
-        <div style="display:flex;flex-direction:column;justify-content:center;gap:10px;">
-            <div style="display:flex;align-items:center;gap:10px;">
-                <span style="width:10px;height:10px;border-radius:50%;background:#639922;"></span>
-                <span style="color:#2C2C2A;font-size:14px;flex:1;">Positive</span>
-                <span style="font-weight:700;color:#3B6D11;">{pos_pct}%</span>
-            </div>
-            <div style="display:flex;align-items:center;gap:10px;">
-                <span style="width:10px;height:10px;border-radius:50%;background:#B4B2A9;"></span>
-                <span style="color:#2C2C2A;font-size:14px;flex:1;">Neutral</span>
-                <span style="font-weight:700;color:#5F5E5A;">{neu_pct}%</span>
-            </div>
-            <div style="display:flex;align-items:center;gap:10px;">
-                <span style="width:10px;height:10px;border-radius:50%;background:#E24B4A;"></span>
-                <span style="color:#2C2C2A;font-size:14px;flex:1;">Negative</span>
-                <span style="font-weight:700;color:#A32D2D;">{neg_pct}%</span>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    if show_summary:
+        st.subheader("How do people feel?")
+        st.markdown(single_summary_html(counts, total), unsafe_allow_html=True)
+        st.caption("Each comment or news item is classified as positive, neutral or negative by PULSE's sentiment models.")
 
     reason_key = f"reason_summaries_{key_prefix}_{result['keyword']}"
     if reason_key not in st.session_state:
@@ -800,20 +812,14 @@ def render_result(result, key_prefix):
     else:
         pos_reason, neg_reason = st.session_state[reason_key]
 
-    st.markdown(f"""
-    <div style="background:#fff;border-radius:14px;padding:6px;border:0.5px solid #E5E2D9;box-shadow:0 1px 3px rgba(44,44,42,0.05);">
-        <div style="padding:14px 16px;border-bottom:0.5px solid #F0EEE8;">
-            <p style="font-size:13px;font-weight:600;margin:0 0 6px;color:#3B6D11;">Positive because</p>
-            <p style="color:#5F5E5A;font-size:13px;line-height:1.6;margin:0;">{pos_reason}</p>
-        </div>
-        <div style="padding:14px 16px;">
-            <p style="font-size:13px;font-weight:600;margin:0 0 6px;color:#A32D2D;">Negative because</p>
-            <p style="color:#5F5E5A;font-size:13px;line-height:1.6;margin:0;">{neg_reason}</p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+    st.subheader("Why do people feel this way?")
+    st.caption("AI-written summaries of what the positive and the negative comments are about.")
+    with st.container(border=True, key=f"mood_pos_{key_prefix}"):
+        st.markdown("**🟢 Positive because**")
+        st.markdown(md_safe(pos_reason))
+    with st.container(border=True, key=f"mood_neg_{key_prefix}"):
+        st.markdown("**🔴 Negative because**")
+        st.markdown(md_safe(neg_reason))
 
     platform_data = {}
     for platform in ["YouTube", "News"]:
@@ -832,6 +838,8 @@ def render_result(result, key_prefix):
         }
 
     if len(platform_data) >= 1:
+        st.subheader("How do the sources compare?")
+        st.caption("Share of positive, neutral and negative messages on each source.")
         rows_html = ""
         for platform, stats in platform_data.items():
             rows_html += (
@@ -854,7 +862,6 @@ def render_result(result, key_prefix):
 
         st.markdown(
             f'<div style="background:#fff;border-radius:14px;padding:20px;border:0.5px solid #E5E2D9;box-shadow:0 1px 3px rgba(44,44,42,0.05);">'
-            f'<p style="font-size:13px;font-weight:600;margin:0 0 16px;color:#2C2C2A;">Platform comparison</p>'
             f'{rows_html}'
             f'</div>',
             unsafe_allow_html=True
@@ -906,341 +913,276 @@ def render_result(result, key_prefix):
             )
 
 
+def render_segment_card(card):
+    with st.container(border=True, key=f"mood_{card['tone']}_seg{card['rank']}"):
+        st.markdown(f"#### 👥 Group {card['rank']}: {md_safe(card['title'])}")
+        tag = f"Topic area: {card['topic_tag']} · " if card["topic_tag"] else ""
+        st.caption(f"{tag}{card['size_pct']}% of all messages · {card['count']:,} messages")
+        st.markdown(md_safe(card["summary"]))
+        st.markdown("**How do they feel?**")
+        if card["shares"]:
+            st.markdown(mood_bar_html(card["shares"]), unsafe_allow_html=True)
+        else:
+            st.caption("Not enough analysed messages in this group yet.")
+        col_lang, col_src = st.columns(2)
+        with col_lang:
+            st.markdown("**Languages**")
+            for item in card["languages"]:
+                st.markdown(f"{md_safe(item['name'])} · {item['share']}%")
+        with col_src:
+            st.markdown("**Where they write**")
+            for item in card["platforms"]:
+                st.markdown(f"{md_safe(item['platform'])} · {item['share']}%")
+        if card["reactions"]:
+            st.markdown(f"**How much people react:** {card['reactions']}")
+            st.caption(card["reactions_note"])
+        if card["trend_text"]:
+            st.markdown(f"**Over time:** {card['trend_text']}")
+        with st.expander("Words and example messages"):
+            if card["words"]:
+                st.caption("Words that define this group: " + ", ".join(md_safe(word) for word in card["words"]))
+            for text in card["examples"]:
+                st.markdown(f"> {md_safe(text)}")
+
+
 def render_audience_segments(result):
     if result["status"] != "ok":
         st.warning(
-            f"Not enough data to build segments. Found {result['usable_events']} usable messages, "
-            f"at least {result['min_required']} are needed. Run more searches first."
+            f"Not enough data yet. PULSE found {result['usable_events']} usable messages and needs at least {result['min_required']}. "
+            "Open Live Search and collect more messages first."
         )
         return
 
-    quality = result["silhouette"]
-    quality_text = f" · cluster quality {quality} (silhouette)" if quality is not None else ""
-    st.markdown(
-        f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 4px 0;'>{result['usable_events']} messages grouped into "
-        f"{len(result['segments'])} segments{quality_text} · {result['analyzed_events']} with sentiment</p>",
-        unsafe_allow_html=True
-    )
-    st.caption("Segments group similar messages by topic and wording. They describe conversations, not individual people.")
+    overview = audience_overview(result)
+    st.subheader("Who is talking")
+    st.markdown(f"**{overview['headline']}**")
+    st.caption("Groups are made from similar words and topics. They describe conversations, not individual people.")
 
-    trend_colors = {"growing": "#3B6D11", "shrinking": "#A32D2D", "stable": "#5F5E5A"}
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        metric_card("Messages grouped", f"{overview['messages']:,}", "Messages PULSE looked at", "Messages with enough text to be grouped.", "🟢", "green")
+    with kpi2:
+        metric_card("Groups found", overview["groups"], "Different kinds of conversation", "Each group is a set of messages that use similar words.", "🔵", "blue")
+    with kpi3:
+        metric_card("Biggest group", f"{overview['biggest_pct']}%", "Share of all messages", "How much of the conversation the largest group covers.", "🟠", "amber")
+    with kpi4:
+        metric_card("Growing groups", overview["growing"], "Getting a bigger share", "Groups whose share grew between the earlier and later half of the data.", "🟣", "purple")
 
-    for segment in result["segments"]:
-        name = html.escape(segment["name"])
-        size_pct = round(segment["size"] * 100)
+    st.subheader("The groups")
+    st.caption("Biggest group first. The card colour shows the overall mood: green positive, grey neutral, red negative.")
+    for card in overview["cards"]:
+        render_segment_card(card)
 
-        pills = "".join(
-            f"<span style='display:inline-block;background:#EAF3DE;color:#3B6D11;padding:3px 10px;border-radius:14px;"
-            f"font-size:12px;font-weight:600;margin:0 6px 6px 0;'>{html.escape(topic)}</span>"
-            for topic in segment["top_topics"]
-        )
-
-        sentiment = segment["sentiment"]
-        if sentiment:
-            pos = round(sentiment["positive"] * 100)
-            neu = round(sentiment["neutral"] * 100)
-            neg = round(sentiment["negative"] * 100)
-            sentiment_html = (
-                f"<div style='display:flex;width:100%;height:10px;border-radius:6px;overflow:hidden;background:#F0EEE8;'>"
-                f"<div style='width:{pos}%;background:#639922;'></div>"
-                f"<div style='width:{neu}%;background:#B4B2A9;'></div>"
-                f"<div style='width:{neg}%;background:#E24B4A;'></div></div>"
-                f"<div style='display:flex;justify-content:space-between;margin-top:4px;'>"
-                f"<span style='font-size:11px;color:#3B6D11;'>{pos}% positive</span>"
-                f"<span style='font-size:11px;color:#5F5E5A;'>{neu}% neutral</span>"
-                f"<span style='font-size:11px;color:#A32D2D;'>{neg}% negative</span></div>"
-            )
-        else:
-            sentiment_html = "<p style='color:#888780;font-size:12px;margin:0;'>Sentiment not available for this segment yet.</p>"
-
-        languages = ", ".join(f"{html.escape(item['name'])} {round(item['share'] * 100)}%" for item in segment["languages"])
-        platforms = ", ".join(f"{html.escape(platform)} {round(share * 100)}%" for platform, share in segment["platforms"].items())
-        engagement = segment["engagement"]
-        engagement_text = (
-            f"{engagement['avg_likes']} likes · {engagement['avg_replies']} replies · {engagement['avg_views']} views per message"
-        )
-
-        trend = segment["trend"]
-        if trend["status"] == "ok":
-            color = trend_colors.get(trend["label"], "#5F5E5A")
-            trend_html = (
-                f"<span style='color:{color};font-weight:600;'>{trend['label']}</span> "
-                f"({trend['shift_points']:+.1f} pts share, earlier vs later period)"
-            )
-        else:
-            trend_html = "<span style='color:#888780;'>not enough time history yet</span>"
-
-        st.markdown(
-            f"<div style='background:#fff;border-radius:14px;padding:18px 20px;border:0.5px solid #E5E2D9;"
-            f"box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:12px;'>"
-            f"<div style='display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;'>"
-            f"<span style='font-size:15px;font-weight:700;color:#2C2C2A;'>{name}</span>"
-            f"<span style='font-size:12px;color:#5F5E5A;'>{size_pct}% of messages · {segment['count']} messages</span></div>"
-            f"<div style='margin-bottom:10px;'>{pills}</div>"
-            f"{sentiment_html}"
-            f"<div style='margin-top:12px;font-size:12px;color:#5F5E5A;line-height:1.8;'>"
-            f"<div><b style='color:#2C2C2A;'>Languages:</b> {languages}</div>"
-            f"<div><b style='color:#2C2C2A;'>Sources:</b> {platforms}</div>"
-            f"<div><b style='color:#2C2C2A;'>Engagement:</b> {engagement_text}</div>"
-            f"<div><b style='color:#2C2C2A;'>Trend:</b> {trend_html}</div></div></div>",
-            unsafe_allow_html=True
-        )
-
-        with st.expander(f"Sample messages from {segment['segment_id']}"):
-            for text in segment["sample_texts"]:
+    if overview["links"]:
+        st.subheader("Which group talks about which keyword")
+        st.caption("For each of your most searched keywords, the group that talks about it the most.")
+        with st.container(border=True, key="mood_neu_links"):
+            for row in overview["links"]:
                 st.markdown(
-                    f"<div style='padding:6px 0;border-bottom:0.5px solid #F0EEE8;font-size:13px;color:#2C2C2A;'>{html.escape(text)}</div>",
-                    unsafe_allow_html=True
+                    f"**{md_safe(row['keyword'])}** → {md_safe(row['group'])}  \n"
+                    f"{row['share']}% of this keyword's messages are in that group, "
+                    f"which is {row['lift']}x more than its share of all messages."
                 )
 
-    keyword_rows = sorted(result["keyword_totals"].items(), key=lambda item: item[1], reverse=True)[:5]
-    if keyword_rows:
-        st.markdown("**Most associated segment per keyword**")
-        for keyword, _ in keyword_rows:
-            ranked = segments_for_keyword(result, keyword)
-            if not ranked:
-                continue
-            top = ranked[0]
-            st.markdown(
-                f"<div style='font-size:13px;padding:6px 0;border-bottom:0.5px solid #F0EEE8;color:#2C2C2A;'>"
-                f"<b>{html.escape(keyword)}</b> → {html.escape(top['name'])} "
-                f"<span style='color:#5F5E5A;'>({round(top['share_of_keyword'] * 100)}% of its messages · "
-                f"{top['lift']}x over-represented)</span></div>",
-                unsafe_allow_html=True
+    with st.expander("How was this worked out?"):
+        notes = [
+            "PULSE turns each message into word weights and then groups messages that use similar words.",
+            "No age, gender or personal details are guessed. Groups only reflect what people wrote.",
+        ]
+        if overview["quality"] is not None:
+            notes.append(f"Group separation score: {overview['quality']} (closer to 1 means cleaner groups).")
+        if overview["quality_low"]:
+            notes.append("This score is low, so the groups overlap a lot. Treat them as a rough guide, not sharp boundaries.")
+        notes.append("Language names come from automatic detection and can be wrong for mixed Hindi-English text.")
+        st.markdown("\n".join(f"- {note}" for note in notes))
+
+
+def render_trend_card(card):
+    with st.container(border=True, key=f"trend_{card['tone']}_{card['topic_id']}"):
+        st.markdown(f"#### {card['icon']} {md_safe(card['title'])}")
+        st.caption(card["status_label"])
+        col_before, col_now, col_change = st.columns(3)
+        col_before.metric("Messages before", card["before"], help="Messages about this topic in the earlier time block.")
+        col_now.metric("Messages now", card["now"], help="Messages about this topic in the latest time block.")
+        col_change.metric("Change", card["change"], help="How much the message count changed. 'New' means there were none before.")
+        st.markdown(f"**What is happening:** {md_safe(card['explanation'])}")
+        st.markdown(f"**How people feel:** {md_safe(card['mood'])}")
+        if card["repeated_warning"]:
+            st.warning(
+                f"About {card['repeated_share']}% of the messages in this topic are repeated or near-identical. "
+                "That can mean copy-pasted promotion or spam rather than real discussion."
             )
+        if card["searched_for"]:
+            st.caption("Collected while searching for: " + ", ".join(md_safe(word) for word in card["searched_for"]))
+        with st.expander("See example messages"):
+            if card["words"]:
+                st.caption("Words that define this topic: " + ", ".join(md_safe(word) for word in card["words"]))
+            for example in card["examples"]:
+                source = f"**{example['platform']}**  " if example["platform"] else ""
+                st.markdown(f"{source}\n> {md_safe(example['text'])}")
 
 
 def render_topic_trends(result):
     if result["status"] == "insufficient_data":
         st.warning(
-            f"Not enough data for topic trends. Found {result['usable_events']} usable messages, "
-            f"at least {result['min_required']} are needed. Run more searches first."
+            f"Not enough data yet. PULSE found {result['usable_events']} usable messages and needs at least {result['min_required']}. "
+            "Open Live Search and collect more messages first."
         )
         return
     if result["status"] == "insufficient_history":
-        st.warning("All collected messages fall within a very short time span, so growth can't be measured yet. Collect data over a longer period.")
+        st.warning("All collected messages are from a very short stretch of time, so PULSE can't tell what is growing yet. Collect data over a longer period.")
         return
 
-    window = result["window_hours"]
-    st.markdown(
-        f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 4px 0;'>Latest {window:g}h compared with the {window:g}h before it · "
-        f"{result['usable_events']} messages · {len(result['topics'])} topics shown</p>",
-        unsafe_allow_html=True
+    overview = trends_overview(result)
+    window = overview["window_hours"]
+    st.subheader("What changed")
+    st.markdown(f"**{overview['headline']}**")
+    st.caption(
+        f"PULSE compared the latest {window:g} hours with the {window:g} hours before it, using {overview['messages']} messages."
     )
-    notes = [
-        f"Topics with fewer than {result['min_volume']} mentions in a window are ignored ({result['dropped_low_volume']} dropped).",
-        "Topics come from a TF-IDF + NMF topic model, which groups words that appear together."
-    ]
-    if not result["persistence_evaluated"]:
-        notes.append("Persistent status needs at least three windows of history, so it is not assigned yet.")
-    st.caption(" ".join(notes))
 
-    if not result["topics"]:
-        st.info("No topic reached the minimum volume. Collect more data and try again.")
-        return
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        metric_card("Topics found", overview["total"], "Groups of messages about the same thing", "Each topic is a group of messages that use similar words.", "🔵", "blue")
+    with kpi2:
+        metric_card("New topics", overview["new"], "Just appeared", "Topics that were almost absent before and suddenly showed up.", "🆕", "amber")
+    with kpi3:
+        metric_card("Growing topics", overview["growing"], "Getting more messages", "Topics that already existed and are clearly growing.", "📈", "green")
+    with kpi4:
+        metric_card("Fading topics", overview["fading"], "Getting fewer messages", "Topics that lost a lot of attention.", "📉", "red")
 
-    status_colors = {
-        "Emerging": "#D98A2B", "Rising": "#3B6D11", "Persistent": "#3B8AD9",
-        "Stable": "#5F5E5A", "Declining": "#A32D2D"
-    }
+    if not overview["sections"]:
+        st.info("No topic had enough messages to be shown. Collect more data and try again.")
+    for section in overview["sections"]:
+        st.subheader(section["title"])
+        st.caption(section["caption"])
+        for card in section["cards"]:
+            render_trend_card(card)
 
-    for topic in result["topics"]:
-        color = status_colors.get(topic["status"], "#5F5E5A")
-        growth_text = "new" if topic["growth_pct"] is None else f"{topic['growth_pct']:+.0f}%"
-        velocity_text = f"{topic['velocity']} ({topic['velocity_per_hour']:+.2f} messages/hour)"
+    with st.expander("How was this worked out?"):
+        notes = [
+            "PULSE groups messages that use similar words into topics, then counts how many messages each topic got in the latest time block and in the block before it.",
+            f"Topics with fewer than {overview['min_volume']} messages in a block are left out ({overview['dropped']} left out this time).",
+            "A topic is called new or growing only when the increase is bigger than normal ups and downs.",
+        ]
+        if not overview["persistence_evaluated"]:
+            notes.append("Steady and long-running topics need more history than is collected so far, so that label is not used yet.")
+        st.markdown("\n".join(f"- {note}" for note in notes))
 
-        sentiment = topic["sentiment"]
-        if sentiment["status"] == "ok":
-            prev_s = sentiment["previous"]
-            cur_s = sentiment["current"]
-            sentiment_color = "#A32D2D" if sentiment["direction"] == "more negative" else "#3B6D11" if sentiment["direction"] == "more positive" else "#5F5E5A"
-            sentiment_html = (
-                f"<span style='color:{sentiment_color};font-weight:600;'>{sentiment['direction']}</span> "
-                f"(negative {round(prev_s['negative_share'] * 100)}% → {round(cur_s['negative_share'] * 100)}%)"
-            )
+
+def render_community_card(card):
+    with st.container(border=True, key=f"mood_{card['tone']}_com{card['rank']}"):
+        st.markdown(f"#### 🧩 {card['name']}: {md_safe(card['title'])}")
+        st.caption(f"{card['authors']:,} {'person or account' if card['authors'] == 1 else 'people or accounts'} · {card['sources']:,} {'channel or video' if card['sources'] == 1 else 'channels or videos'} · {card['messages']:,} messages")
+        if card["single_voice"]:
+            st.info("This is mostly one account or channel posting many messages, so it is not a real crowd of people.")
+        st.markdown("**How do they feel?**")
+        if card["shares"]:
+            st.markdown(mood_bar_html(card["shares"]), unsafe_allow_html=True)
         else:
-            sentiment_html = "<span style='color:#888780;'>not enough analyzed messages in both windows</span>"
+            st.caption("Not enough analysed messages in this community yet.")
+        if card["main_sources"]:
+            st.markdown("**Where they mostly write:** " + "; ".join(f"{md_safe(item['label'])} ({item['messages']})" for item in card["main_sources"]))
+        if card["platforms"]:
+            st.caption("Platforms: " + ", ".join(f"{item['platform']} {item['share']}%" for item in card["platforms"]))
+        with st.expander("Words and topics"):
+            if card["words"]:
+                st.caption("Words this community uses more than others: " + ", ".join(md_safe(word) for word in card["words"]))
+            if card["topics"]:
+                st.markdown("\n".join(f"- {md_safe(item['name'])} ({item['count']} messages)" for item in card["topics"]))
+            else:
+                st.caption("No topic had enough messages here.")
 
-        keywords = ", ".join(f"{html.escape(item['keyword'])} ({item['count']})" for item in topic["keywords"]) or "none"
-        terms = "".join(
-            f"<span style='display:inline-block;background:#F0EEE8;color:#2C2C2A;padding:3px 10px;border-radius:14px;"
-            f"font-size:12px;margin:0 6px 6px 0;'>{html.escape(term)}</span>"
-            for term in topic["terms"]
-        )
 
-        st.markdown(
-            f"<div style='background:#fff;border-radius:14px;padding:18px 20px;border:0.5px solid #E5E2D9;"
-            f"box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:12px;border-left:4px solid {color};'>"
-            f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;'>"
-            f"<span style='font-size:15px;font-weight:700;color:#2C2C2A;'>{html.escape(topic['name'])}</span>"
-            f"<span style='background:{color};color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;'>"
-            f"{topic['status'].upper()}</span></div>"
-            f"<div style='margin-bottom:8px;'>{terms}</div>"
-            f"<div style='display:flex;gap:28px;margin-bottom:8px;'>"
-            f"<div><div style='font-size:11px;color:#888780;'>Mentions</div>"
-            f"<div style='font-size:18px;font-weight:700;color:#2C2C2A;'>{topic['previous']} → {topic['current']}</div></div>"
-            f"<div><div style='font-size:11px;color:#888780;'>Growth</div>"
-            f"<div style='font-size:18px;font-weight:700;color:{color};'>{growth_text}</div></div></div>"
-            f"<div style='font-size:12px;color:#5F5E5A;line-height:1.8;'>"
-            f"<div><b style='color:#2C2C2A;'>Velocity:</b> {velocity_text}</div>"
-            f"<div><b style='color:#2C2C2A;'>Share of conversation:</b> {round(topic['share_previous'] * 100)}% → {round(topic['share_current'] * 100)}%</div>"
-            f"<div><b style='color:#2C2C2A;'>Sentiment:</b> {sentiment_html}</div>"
-            f"<div><b style='color:#2C2C2A;'>Keywords:</b> {keywords}</div></div></div>",
-            unsafe_allow_html=True
-        )
-
-        with st.expander(f"Sample messages from {topic['topic_id']}"):
-            for text in topic["sample_texts"]:
-                st.markdown(
-                    f"<div style='padding:6px 0;border-bottom:0.5px solid #F0EEE8;font-size:13px;color:#2C2C2A;'>{html.escape(text)}</div>",
-                    unsafe_allow_html=True
-                )
+def render_node_list(title, rows, caption):
+    st.markdown(f"**{title}**")
+    st.caption(caption)
+    if not rows:
+        st.caption("Nothing to show yet.")
+    for row in rows:
+        st.markdown(f"{md_safe(row['label'])}")
+        st.progress(min(1.0, max(0.0, row["level"])))
+        st.caption(f"{row['connections']} connections · {row['messages']} messages · {row['community']} · {row['mood']}")
 
 
 def render_network_intelligence(result, graph):
-    for note in result["limitations"]:
-        st.caption(note)
-
     if result["status"] != "ok":
         st.warning(
-            f"Not enough network data. Found {result['network_events']} messages with a participant identity, "
-            f"at least {result['min_required']} are needed. Run more YouTube or Telegram searches first."
+            f"Not enough network data yet. PULSE found {result['network_events']} messages with a known author and needs at least {result['min_required']}. "
+            "Collect more YouTube or Telegram messages in Live Search first."
         )
+        for note in result["limitations"]:
+            st.caption(note)
         return
 
-    st.markdown(
-        f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 6px 0;'>{result['authors']} participants · {result['sources']} sources · "
-        f"{result['edges']} connections · {result['communities_significant']} communities "
-        f"(with at least {result['min_community_messages']} messages)</p>",
-        unsafe_allow_html=True
-    )
+    overview = network_overview(result)
+    st.subheader("Who is connected to whom")
+    st.markdown(f"**{overview['headline']}**")
+    st.caption("A community is a set of people and channels that mostly interact with each other.")
 
-    st.markdown("**Communities**")
-    for community in result["communities"]:
-        color = community_color(community["community_id"])
-        sentiment = community["sentiment"]
-        if sentiment:
-            pos = round(sentiment["positive"] * 100)
-            neu = round(sentiment["neutral"] * 100)
-            neg = round(sentiment["negative"] * 100)
-            sentiment_html = (
-                f"<div style='display:flex;width:100%;height:10px;border-radius:6px;overflow:hidden;background:#F0EEE8;'>"
-                f"<div style='width:{pos}%;background:#639922;'></div>"
-                f"<div style='width:{neu}%;background:#B4B2A9;'></div>"
-                f"<div style='width:{neg}%;background:#E24B4A;'></div></div>"
-                f"<div style='font-size:11px;color:#5F5E5A;margin-top:4px;'>{pos}% positive · {neu}% neutral · {neg}% negative</div>"
-            )
-        else:
-            sentiment_html = "<div style='font-size:12px;color:#888780;'>Sentiment not available yet.</div>"
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        metric_card("People or accounts", f"{overview['people']:,}", "Who wrote the messages", "Distinct authors found in the collected messages.", "🟢", "green")
+    with kpi2:
+        metric_card("Channels and videos", f"{overview['sources']:,}", "Where they wrote", "Distinct channels or videos the messages came from.", "🔵", "blue")
+    with kpi3:
+        metric_card("Connections", f"{overview['connections']:,}", "Person to channel links", "Each connection means a person wrote in a channel or video.", "🟠", "amber")
+    with kpi4:
+        metric_card("Communities", len(overview["communities"]), f"With {overview['min_messages']}+ messages", "Communities too small to matter are left out.", "🟣", "purple")
 
-        terms = ", ".join(html.escape(term) for term in community["top_terms"]) or "none"
-        topics = ", ".join(f"{html.escape(item['name'])} ({item['count']})" for item in community["top_topics"]) or "no topic reached the minimum volume"
-        sources = ", ".join(f"{html.escape(item['label'])} ({item['messages']})" for item in community["top_sources"])
-        platforms = ", ".join(f"{html.escape(name)} {round(share * 100)}%" for name, share in community["platforms"].items())
+    st.subheader("Communities")
+    st.caption("Biggest first. The card colour shows the overall mood: green positive, grey neutral, red negative.")
+    if overview["single_voice_count"]:
+        st.caption(f"{overview['single_voice_count']} of these are really one account or channel posting a lot, not a crowd.")
+    for card in overview["communities"]:
+        render_community_card(card)
 
-        st.markdown(
-            f"<div style='background:#fff;border-radius:14px;padding:16px 20px;border:0.5px solid #E5E2D9;"
-            f"box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:12px;border-left:4px solid {color};'>"
-            f"<div style='display:flex;justify-content:space-between;margin-bottom:10px;'>"
-            f"<span style='font-size:14px;font-weight:700;color:#2C2C2A;'>{community['community_id']}</span>"
-            f"<span style='font-size:12px;color:#5F5E5A;'>{community['authors']} participants · {community['sources']} sources · "
-            f"{community['messages']} messages</span></div>"
-            f"{sentiment_html}"
-            f"<div style='margin-top:10px;font-size:12px;color:#5F5E5A;line-height:1.8;'>"
-            f"<div><b style='color:#2C2C2A;'>Distinctive terms:</b> {terms}</div>"
-            f"<div><b style='color:#2C2C2A;'>Main topics:</b> {topics}</div>"
-            f"<div><b style='color:#2C2C2A;'>Main sources:</b> {sources}</div>"
-            f"<div><b style='color:#2C2C2A;'>Platforms:</b> {platforms}</div></div></div>",
-            unsafe_allow_html=True
-        )
+    st.subheader("Connectors between communities")
+    st.caption("People or channels that are active in more than one community. They help ideas travel between groups.")
+    if not overview["bridges"]:
+        st.info("None found yet. These appear when the same person is active in channels that belong to different communities.")
+    for row in overview["bridges"]:
+        with st.container(border=True, key=f"mood_neu_bridge{abs(hash(row['label'])) % 100000}"):
+            st.markdown(f"**🔗 {md_safe(row['label'])}**")
+            st.caption(f"{row['kind']} · {row['platform']}")
+            st.markdown(md_safe(row["text"]))
 
-    st.markdown("**Bridge nodes**")
-    st.caption("Participants or sources whose activity is split across different communities (at least 20% outside their main one).")
-    if not result["bridge_nodes"]:
-        st.info("No bridge nodes found. They appear when the same participant is active in sources that belong to different communities.")
-    for node in result["bridge_nodes"]:
-        connected = ", ".join(node["communities_connected"])
-        st.markdown(
-            f"<div style='font-size:13px;padding:8px 0;border-bottom:0.5px solid #F0EEE8;color:#2C2C2A;'>"
-            f"<b>{html.escape(node['label'])}</b> <span style='color:#888780;'>({node['type']}, {node['platform']})</span> connects {connected} "
-            f"<span style='color:#5F5E5A;'>· {round(node['bridge_share'] * 100)}% of activity outside the main community · "
-            f"betweenness {node['betweenness']}</span></div>",
-            unsafe_allow_html=True
-        )
+    st.subheader("Most connected")
+    st.caption("Ranked by how well connected they are to other well-connected nodes. This shows position in the network, not real-world influence.")
+    col_people, col_sources = st.columns(2)
+    with col_people:
+        render_node_list("People and accounts", overview["top_people"], "Who is most central.")
+    with col_sources:
+        render_node_list("Channels and videos", overview["top_sources"], "Which places are most central.")
 
-    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
-    st.markdown("**Most structurally important nodes**")
-    st.caption("PageRank rewards nodes connected to other well-connected nodes. It is a structural measure, not proof of real-world influence.")
+    st.subheader("How topics spread")
+    st.caption("For each topic, which communities talked about it and in what order.")
+    if not overview["spreads"]:
+        st.info("No topic had enough messages in a community yet. Collect more messages over a longer time and try again.")
+    for item in overview["spreads"]:
+        with st.container(border=True, key=f"trend_{item['tone']}_spread{abs(hash(item['name'])) % 100000}"):
+            st.markdown(f"#### {item['icon']} {md_safe(item['name'])}")
+            st.caption(item["label"])
+            st.markdown(md_safe(item["reach"]))
+            for step in item["steps"]:
+                st.markdown(f"- {md_safe(step)}")
 
-    def sentiment_word(score):
-        if score is None:
-            return "n/a"
-        if score >= 0.3:
-            return "mostly positive"
-        if score <= -0.3:
-            return "mostly negative"
-        return "mixed or neutral"
-
-    nc1, nc2 = st.columns(2)
-    for column, heading, nodes, bar_color in (
-        (nc1, "Participants", result["top_authors"], "#639922"),
-        (nc2, "Channels and videos", result["top_sources"], "#E24B4A"),
-    ):
-        with column:
-            st.markdown(f"**{heading}**")
-            max_rank = max([node["pagerank"] for node in nodes], default=0) or 1
-            for node in nodes:
-                bar_pct = round(node["pagerank"] / max_rank * 100)
-                st.markdown(
-                    f"<div style='margin-bottom:10px;'>"
-                    f"<div style='display:flex;justify-content:space-between;font-size:13px;margin-bottom:3px;'>"
-                    f"<span style='color:#2C2C2A;'>{html.escape(node['label'])}</span>"
-                    f"<span style='color:#5F5E5A;'>{node['connections']} connections · {node['messages']} messages</span></div>"
-                    f"<div style='background:#F0EEE8;border-radius:5px;height:8px;overflow:hidden;'>"
-                    f"<div style='width:{bar_pct}%;background:{bar_color};height:100%;'></div></div>"
-                    f"<div style='font-size:11px;color:#888780;margin-top:2px;'>{node['community_id'] or 'minor community'} · "
-                    f"{sentiment_word(node['sentiment_score'])}</div></div>",
-                    unsafe_allow_html=True
-                )
-
-    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
-    st.markdown("**Topic propagation across communities**")
-    if not result["propagation"]:
-        st.info("No topic reached the minimum mentions in a community yet. Topic propagation needs enough messages and time history (see Topic Trends).")
-    spread_colors = {"high": "#D98A2B", "medium": "#3B8AD9", "contained": "#5F5E5A"}
-    for item in result["propagation"]:
-        steps = []
-        for position, step in enumerate(item["timeline"]):
-            timing = "first seen" if position == 0 else (f"+{step['lag_hours']}h" if step["lag_hours"] is not None else "")
-            steps.append(
-                f"<span style='color:{community_color(step['community_id'])};font-weight:600;'>{step['community_id']}</span> "
-                f"({step['mentions']} mentions, {timing})"
-            )
-        badge_color = spread_colors.get(item["spread"], "#5F5E5A")
-        st.markdown(
-            f"<div style='background:#fff;border-radius:14px;padding:14px 18px;border:0.5px solid #E5E2D9;margin-bottom:10px;'>"
-            f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;'>"
-            f"<span style='font-size:14px;font-weight:700;color:#2C2C2A;'>{html.escape(item['name'])}</span>"
-            f"<span style='background:{badge_color};color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;'>"
-            f"{item['spread'].upper()} SPREAD</span></div>"
-            f"<div style='font-size:12px;color:#5F5E5A;margin-bottom:6px;'>Reached {item['communities_reached']} of "
-            f"{item['total_communities']} communities · {item['total_mentions']} mentions</div>"
-            f"<div style='font-size:12px;color:#2C2C2A;line-height:1.8;'>{' → '.join(steps)}</div></div>",
-            unsafe_allow_html=True
-        )
-
-    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
-    st.markdown("**Interactive Network Graph** — colors are communities, squares are channels or videos, thick border is a bridge node, size is PageRank")
+    st.subheader("Network map")
+    st.caption("Each dot is a person (round) or a channel or video (square). Colours are communities, a thick border marks a connector, and bigger means more central. You can drag and zoom.")
     html_file = generate_network_html(graph)
     with open(html_file, "r", encoding="utf-8") as f:
         graph_html = f.read()
     st.components.v1.html(graph_html, height=620)
 
+    if overview["notes"]:
+        with st.expander("Things to keep in mind"):
+            st.markdown("\n".join(f"- {md_safe(note)}" for note in overview["notes"]))
+            st.markdown("- Communities are found automatically from who writes where, so they are a rough guide.")
+
 
 PAGES = [
     "Command Center",
     "Live Search",
-    "Telegram Search",
     "Sentiment",
     "Trends",
     "Audience",
@@ -1266,119 +1208,140 @@ VECTOR_LABELS = {"trend": "Trend", "sentiment": "Sentiment", "audience": "Audien
 
 
 def render_signal_card(signal, key_prefix):
-    color = SIGNAL_PRIORITY_COLORS.get(signal["priority"], "#5F5E5A")
-    terms = "".join(
-        f"<span style='display:inline-block;background:#F0EEE8;color:#2C2C2A;padding:3px 10px;border-radius:14px;"
-        f"font-size:12px;margin:0 6px 6px 0;'>{html.escape(term)}</span>"
-        for term in signal["terms"]
-    )
-    rows = [
-        ("WHAT", signal["what"]),
-        ("WHO", signal["who"]),
-        ("HOW THEY FEEL", signal["how_they_feel"]),
-        ("HOW IT SPREADS", signal["how_it_spreads"]),
-        ("HOW FAST", signal["how_fast"]),
-        ("WHY IT MATTERS", signal["why_it_matters"]),
-    ]
-    rows_html = "".join(
-        f"<div style='margin-bottom:8px;'><div style='font-size:10px;font-weight:700;color:#888780;letter-spacing:0.06em;'>{label}</div>"
-        f"<div style='font-size:13px;color:#2C2C2A;line-height:1.5;'>{html.escape(str(value))}</div></div>"
-        for label, value in rows
-    )
-    st.markdown(
-        f"<div style='background:#fff;border-radius:14px;padding:18px 20px;border:0.5px solid #E5E2D9;"
-        f"box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:12px;border-left:4px solid {color};'>"
-        f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;'>"
-        f"<span style='font-size:15px;font-weight:700;color:#2C2C2A;'>{html.escape(signal['topic'])}</span>"
-        f"<span><span style='background:#F0EEE8;color:#2C2C2A;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;margin-right:6px;'>"
-        f"{signal['type'].upper()}</span>"
-        f"<span style='background:{color};color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;'>"
-        f"{signal['priority'].upper()}</span></span></div>"
-        f"<div style='margin-bottom:8px;'>{terms}</div>"
-        f"<div style='display:flex;gap:28px;margin-bottom:12px;'>"
-        f"<div><div style='font-size:11px;color:#888780;'>Signal score</div>"
-        f"<div style='font-size:20px;font-weight:700;color:{color};'>{signal['score']:.0f}<span style='font-size:12px;color:#888780;'> / 100</span></div></div>"
-        f"<div><div style='font-size:11px;color:#888780;'>Confidence proxy</div>"
-        f"<div style='font-size:20px;font-weight:700;color:#2C2C2A;'>{round(signal['confidence_proxy'] * 100)}%</div></div></div>"
-        f"{rows_html}</div>",
-        unsafe_allow_html=True
-    )
+    card = signal_card(signal)
+    with st.container(border=True, key=f"sig_{card['priority']}_{key_prefix}"):
+        st.markdown(f"#### {card['icon']} {md_safe(card['title'])}")
+        st.caption(f"{card['kind_label']} · {PRIORITY_ICONS.get(card['priority'], '')} {card['priority_name']}")
+        st.markdown(md_safe(card["priority_meaning"]))
+        col_score, col_conf, col_agree = st.columns(3)
+        col_score.metric("Score", f"{card['score']:.0f} / 100", help="A combined score used to rank signals. It is a guide, not a probability.")
+        col_conf.metric("Rough confidence", f"{card['confidence']}%", help="Based on how much data there is and how many checks agree. It is a rough guide, not a calibrated probability.")
+        col_agree.metric("Other checks agree", f"{card['agree_count']} of 3", help="Mood, audience and spread are checked on top of growth. This is how many of them back the signal up.")
+        if card["agree_names"]:
+            st.caption("Backed up by: " + ", ".join(card["agree_names"]))
+        if card["missing_names"]:
+            st.caption("Not available yet: " + ", ".join(card["missing_names"]))
 
-    explanation_key = f"explanation_{signal['signal_id']}"
-    if st.button("Explain this signal", key=f"explain_btn_{key_prefix}"):
-        with st.spinner("Writing an explanation from the detected evidence..."):
-            st.session_state[explanation_key] = explain_signal(signal, llm=generate_gemini_summary)
-    if explanation_key in st.session_state:
-        explanation = st.session_state[explanation_key]
-        if explanation["source"] == "gemini":
-            source_note = "Written by Gemini from the detected evidence only; numbers were checked against the evidence."
-        else:
-            reasons = {
-                "llm_unavailable": "Gemini was unavailable",
-                "ungrounded_numbers": "the Gemini text contained numbers not in the evidence",
-                "too_long": "the Gemini text was too long",
-                "empty": "Gemini returned nothing",
-                "no_llm": "no Gemini key is configured",
-            }
-            source_note = f"Built directly from the detected evidence ({reasons.get(explanation['reason'], explanation['reason'])})."
-        st.markdown(
-            f"<div style='background:#F7F5EF;border-radius:10px;padding:12px 14px;font-size:13px;color:#2C2C2A;line-height:1.6;margin-bottom:6px;'>"
-            f"{html.escape(explanation['text'])}</div>",
-            unsafe_allow_html=True
-        )
-        st.caption(source_note)
-        with st.expander("Evidence given to the explainer"):
-            st.code(explanation["facts"], language=None)
+        st.markdown(f"**What is happening:** {md_safe(card['happening'])}")
+        st.markdown(f"**How fast:** {md_safe(card['speed'])}")
+        st.markdown(f"**Who is talking:** {md_safe(card['people'])}")
+        st.markdown(f"**How people feel:** {md_safe(card['mood'])}")
+        st.markdown(f"**How far it has spread:** {md_safe(card['spread'])}")
+        if card["why"]:
+            st.markdown(f"**Why it matters:** {md_safe(card['why'])}")
 
-    with st.expander("Score breakdown and evidence"):
-        breakdown = []
-        for name in ("trend", "sentiment", "audience", "network"):
-            value = signal["components"].get(name)
-            if value is None:
-                breakdown.append(f"- **{VECTOR_LABELS[name]}**: not available")
-            else:
-                weight = signal["weights_used"].get(name, 0)
-                mark = " (corroborating)" if name in signal["corroborating_vectors"] else ""
-                breakdown.append(f"- **{VECTOR_LABELS[name]}**: {value:.2f} × weight {weight:.2f}{mark}")
-        st.markdown("\n".join(breakdown))
-        st.caption(
-            "The score is a weighted heuristic over the available vectors, renormalized when a vector is missing. "
-            "The weights are documented baseline choices and have not been validated. The confidence proxy reflects data volume, "
-            "vector availability and corroboration; it is not a calibrated probability."
-        )
-        for text in signal.get("sample_texts", []):
-            st.markdown(
-                f"<div style='padding:6px 0;border-bottom:0.5px solid #F0EEE8;font-size:13px;color:#2C2C2A;'>{html.escape(text)}</div>",
-                unsafe_allow_html=True
+        if card["repeated_warning"]:
+            st.warning(
+                f"About {card['repeated_share']}% of the messages in this topic are repeated or near-identical. "
+                "That can mean copy-pasted promotion or spam rather than real discussion."
             )
+        context = []
+        if card["searched_for"]:
+            context.append("Collected while searching for: " + ", ".join(md_safe(word) for word in card["searched_for"]))
+        if card["platforms"]:
+            context.append("Platforms: " + ", ".join(f"{row['platform']} {row['share']}%" for row in card["platforms"]))
+        if context:
+            st.caption(" · ".join(context))
+
+        explanation_key = f"explanation_{signal['signal_id']}"
+        if st.button("Explain in simple words", key=f"explain_btn_{key_prefix}"):
+            with st.spinner("Writing an explanation from the detected evidence..."):
+                st.session_state[explanation_key] = explain_signal(signal, llm=generate_gemini_summary)
+        if explanation_key in st.session_state:
+            explanation = st.session_state[explanation_key]
+            if explanation["source"] == "gemini":
+                source_note = "Written by Gemini using only the detected evidence. Its numbers were checked against that evidence."
+            else:
+                reasons = {
+                    "llm_unavailable": "Gemini was unavailable",
+                    "ungrounded_numbers": "the Gemini text contained numbers not in the evidence",
+                    "too_long": "the Gemini text was too long",
+                    "empty": "Gemini returned nothing",
+                    "no_llm": "no Gemini key is configured",
+                }
+                source_note = f"Built directly from the detected evidence ({reasons.get(explanation['reason'], explanation['reason'])})."
+            st.info(explanation["text"])
+            st.caption(source_note)
+            with st.expander("Evidence given to the explainer"):
+                st.code(explanation["facts"], language=None)
+
+        with st.expander("Examples and score details"):
+            if card["examples"]:
+                st.markdown("**Example messages from this topic**")
+                for example in card["examples"]:
+                    source = f"**{example['platform']}**  " if example["platform"] else ""
+                    st.markdown(f"{source}\n> {md_safe(example['text'])}")
+            if card["words"]:
+                st.caption("Words that define this topic: " + ", ".join(md_safe(word) for word in card["words"]))
+            st.markdown("**How the score was worked out**")
+            breakdown = []
+            for name in ("trend", "sentiment", "audience", "network"):
+                value = signal["components"].get(name)
+                label = CHECK_LABELS[name]
+                if value is None:
+                    breakdown.append(f"- {label}: not available")
+                else:
+                    weight = signal["weights_used"].get(name, 0)
+                    breakdown.append(f"- {label}: {round(value * 100)} out of 100, counts for {round(weight * 100)}% of the score")
+            st.markdown("\n".join(breakdown))
+            st.caption(
+                "The weights are simple starting choices and have not been tested against real outcomes. "
+                "If a check is missing, the others share its weight."
+            )
+
+
+CHECK_LABELS = {"trend": "Growth", "sentiment": "Mood change", "audience": "Audience focus", "network": "Spread across communities"}
 
 
 def render_pulse_signals(result):
     if result["status"] == "insufficient_data":
         st.warning(
-            f"Not enough data to detect signals. Found {result['usable_events']} usable messages, "
-            f"at least {result['min_required']} are needed. Run more searches first."
+            f"Not enough data yet. PULSE found {result['usable_events']} usable messages and needs at least {result['min_required']}. "
+            "Open Live Search and collect more messages first."
         )
         return
     if result["status"] == "insufficient_history":
-        st.warning("All collected messages fall within a very short time span, so growth can't be measured yet. Collect data over a longer period.")
+        st.warning("All collected messages are from a very short stretch of time, so PULSE can't tell what is growing yet. Collect data over a longer period.")
         return
 
-    vectors = result["vectors"]
-    st.markdown(
-        f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 4px 0;'>{result['total_events']} messages · "
-        f"latest {result['window_hours']:g}h window · {len(result['signals'])} signals</p>",
-        unsafe_allow_html=True
-    )
+    overview = signals_overview(result)
+    st.subheader("What needs attention")
+    st.markdown(f"**{overview['headline']}**")
     st.caption(
-        f"Vector status: trends {vectors['trends']}, audience {vectors['audience']}, network {vectors['network']}. "
-        "Sentiment is read from analyzed messages. A signal needs an Emerging or Rising topic with a score of at least 25."
+        f"PULSE compared the latest {overview['window_hours']:g} hours with the {overview['window_hours']:g} hours before it, using {overview['messages']:,} messages."
     )
-    if not result["signals"]:
-        st.info("No Emerging or Rising topic reached the signal threshold in this window.")
-        return
+
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        metric_card("Signals found", overview["total"], "Topics worth a look", "A signal is a new or growing topic that scored high enough.", "📡", "blue")
+    with kpi2:
+        metric_card("High priority", overview["high"], "Look at these first", "Several checks agree these matter.", "🔴", "red")
+    with kpi3:
+        metric_card("New topics", overview["new"], "Just appeared", "Topics that were almost absent before.", "🆕", "amber")
+    with kpi4:
+        metric_card("Growing topics", overview["growing"], "Getting more messages", "Topics that already existed and are growing.", "📈", "green")
+
+    if not overview["cards"]:
+        st.info("No new or growing topic scored high enough in this window. Collect more messages and try again.")
+    else:
+        st.subheader("Signals")
+        st.caption("Strongest first. The card colour shows priority: red high, orange medium, grey low.")
+        st.download_button(
+            "Download signals as CSV",
+            data=signals_csv(result["signals"]),
+            file_name="pulse_signals.csv",
+            mime="text/csv",
+            key="download_signals_csv"
+        )
     for position, signal in enumerate(result["signals"]):
         render_signal_card(signal, key_prefix=f"signal_{position}")
+
+    with st.expander("What did PULSE check?"):
+        names = {"ok": "done", "insufficient_data": "not enough data", "insufficient_history": "not enough history"}
+        lines = [f"- {name}: {names.get(value, value)}" for name, value in overview["checks"].items()]
+        lines.append("- Mood: read from the messages that were analysed")
+        st.markdown("\n".join(lines))
+        st.caption("A signal needs a new or growing topic with a score of at least 25 out of 100.")
 
 
 def render_saved_signals(signals):
@@ -1416,14 +1379,74 @@ def sentiment_frame(counts_by_label):
     ).set_index("Sentiment")
 
 
+def md_safe(text):
+    return re.sub(r"([\\`*_{}\[\]()#+!|<>~$])", r"\\\1", str(text))
+
+
+PRIORITY_ICONS = {"high": "🔴", "medium": "🟠", "low": "⚪"}
+KIND_ICONS = {"emerging": "🆕", "rising": "📈"}
+
+
+KPI_CARD_HEIGHT = 175
+
+
+def metric_card(label, value, note, help_text, icon, tone):
+    with st.container(border=True, height=KPI_CARD_HEIGHT, key=f"kpi_{tone}"):
+        st.metric(f"{icon} {label}", value, help=help_text)
+        st.caption(note)
+
+
+def render_how_to_read():
+    with st.expander("How to read this page"):
+        st.markdown(
+            "- **Topic**: a group of messages that talk about the same thing. PULSE finds these automatically and names each one with its most common words.\n"
+            "- **New topic (Emerging)**: a topic that was almost absent before and has suddenly appeared.\n"
+            "- **Growing topic (Rising)**: a topic that already existed and is getting clearly more messages.\n"
+            "- **Priority**: how strongly different checks agree that the topic matters. Trend growth, sentiment change, audience concentration and spread across communities are all checked.\n"
+            "- **Score (0-100)**: a simple combined number from those checks. It is a guide for ranking, not a probability.\n"
+            "- **Latest window**: the most recent block of time PULSE compares against the block right before it."
+        )
+
+
+def render_signal_highlight(item, position):
+    with st.container(border=True, key=f"sig_{item['priority']}_{position}"):
+        st.markdown(f"#### {KIND_ICONS.get(item['kind'], '')} {md_safe(item['title'])}")
+        st.caption(
+            f"{item['kind_label']} · {PRIORITY_ICONS.get(item['priority'], '')} {item['priority'].title()} priority · score {item['score']:.0f} / 100"
+        )
+        if item["what"]:
+            st.markdown(f"**What is happening:** {md_safe(item['what'])}")
+        if item["why"]:
+            st.markdown(f"**Why it matters:** {md_safe(item['why'])}")
+        if item["repeated_warning"]:
+            st.warning(
+                f"About {item['repeated_share']}% of the messages in this topic are repeated or near-identical. "
+                "That can mean copy-pasted promotion or spam rather than real discussion, so check the examples below."
+            )
+        context = []
+        if item["searched_for"]:
+            context.append("Collected while searching for: " + ", ".join(md_safe(word) for word in item["searched_for"]))
+        if item["platforms"]:
+            context.append("Platforms: " + ", ".join(f"{row['platform']} {row['share']}%" for row in item["platforms"]))
+        if context:
+            st.caption(" · ".join(context))
+        if item["examples"]:
+            st.markdown("**Example messages from this topic**")
+            st.caption("These are the messages that match this topic's keywords most closely. They are here to show what the topic is about.")
+            for example in item["examples"]:
+                source = f"**{example['platform']}**  " if example["platform"] else ""
+                st.markdown(f"{source}\n> {md_safe(example['text'])}")
+
+
 def render_command_center():
-    st.markdown(
-        "<div style='margin-bottom:6px;'><div style='font-size:26px;font-weight:800;letter-spacing:2px;color:#2C2C2A;'>PULSE</div>"
-        "<div style='font-size:12px;font-weight:600;letter-spacing:3px;color:#888780;'>LIVE AUDIENCE INTELLIGENCE</div></div>",
-        unsafe_allow_html=True
-    )
-    if st.button("Refresh intelligence", key="cc_refresh_btn"):
-        load_intelligence.clear()
+    with st.container(key="hero"):
+        st.header("Command Center")
+        st.caption(
+            "PULSE reads YouTube, Telegram and news messages and shows which conversations are growing right now, who is talking, and how they feel."
+        )
+        if st.button("Refresh intelligence", key="cc_refresh_btn"):
+            load_intelligence.clear()
+    render_how_to_read()
 
     try:
         events, pipeline = load_intelligence()
@@ -1433,88 +1456,175 @@ def render_command_center():
 
     summary = command_center_summary(events, pipeline)
     if summary["total_events"] == 0:
-        st.info("No collected data yet. Use the search pages to collect messages first.")
+        st.info("No collected data yet. Open Live Search in the sidebar and collect some messages first.")
         return
 
+    new_count = summary["emerging_signals"]
+    growing_count = summary["rising_signals"]
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     with kpi1:
-        kpi_card("Total Events", f"{summary['total_events']:,}", f"{summary['analyzed_events']:,} analyzed for sentiment", "#3B6D11")
-    with kpi2:
-        kpi_card("Active Topics", summary["active_topics"], "topics above the minimum volume", "#185FA5")
-    with kpi3:
-        kpi_card("Audience Segments", summary["segments"], "observable, not demographic", "#7F5AA2")
-    with kpi4:
-        kpi_card("Emerging Signals", summary["emerging_signals"], f"{summary['rising_signals']} more rising", "#BA7517")
-
-    if summary["pipeline_status"] != "ok":
-        st.warning("Topic trends need more data over a longer period before signals can be detected.")
-
-    st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
-    st.markdown("#### Top Signals")
-    if not summary["top_signals"]:
-        st.caption("No Emerging or Rising topic has reached the signal threshold yet.")
-    for signal in summary["top_signals"]:
-        color = SIGNAL_PRIORITY_COLORS.get(signal["priority"], "#5F5E5A")
-        st.markdown(
-            f"<div style='background:#fff;border-radius:12px;padding:14px 18px;border:0.5px solid #E5E2D9;"
-            f"border-left:4px solid {color};margin-bottom:8px;'>"
-            f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
-            f"<span style='font-size:14px;font-weight:700;color:#2C2C2A;'>{html.escape(signal['topic'])}</span>"
-            f"<span style='font-size:12px;color:#5F5E5A;'>{signal['type'].upper()} · "
-            f"<b style='color:{color};'>{signal['priority'].upper()}</b> · score {signal['score']:.0f}</span></div>"
-            f"<div style='font-size:12px;color:#5F5E5A;margin-top:4px;'>{html.escape(signal['why_it_matters'])}</div></div>",
-            unsafe_allow_html=True
+        metric_card(
+            "Messages collected",
+            f"{summary['total_events']:,}",
+            f"{summary['analyzed_events']:,} checked for mood",
+            "Every YouTube comment, Telegram message and news article stored so far.",
+            "🟢",
+            "green",
         )
-    if summary["top_signals"]:
-        st.caption("Open the PULSE Signals page for the full evidence and explanation.")
+    with kpi2:
+        metric_card(
+            "Topics found",
+            summary["active_topics"],
+            "groups of similar messages",
+            "PULSE groups messages that talk about the same thing. Only groups with enough messages are counted.",
+            "🔵",
+            "blue",
+        )
+    with kpi3:
+        metric_card(
+            "Topics taking off",
+            new_count + growing_count,
+            f"{new_count} new · {growing_count} growing",
+            "New topics just appeared. Growing topics already existed and are getting clearly more messages. Both are listed below.",
+            "🟠",
+            "amber",
+        )
+    with kpi4:
+        metric_card(
+            "Audience groups",
+            summary["segments"],
+            "grouped by what they write",
+            "People are grouped by the topics, language and tone of what they write. Age, gender or identity are never guessed.",
+            "🟣",
+            "purple",
+        )
 
-    left, right = st.columns(2)
-    with left:
-        st.markdown("#### Trend Velocity")
-        if summary["velocity"]:
-            velocity_frame = pd.DataFrame(summary["velocity"]).set_index("topic")[["velocity_per_hour"]]
-            velocity_frame.columns = ["Messages per hour change"]
-            st.bar_chart(velocity_frame, horizontal=True)
-            st.caption("Change in messages per hour, latest window versus the one before it.")
-        else:
-            st.caption("Not enough history to measure velocity yet.")
-    with right:
-        st.markdown("#### Sentiment Overview")
-        overview = sentiment_overview(events)
-        if overview["analyzed_events"]:
-            st.bar_chart(sentiment_frame(overview["distribution"]), horizontal=True, color=["#5F5E5A"])
-            st.caption(f"{overview['analyzed_events']:,} of {overview['total_events']:,} messages have been analyzed.")
-        else:
-            st.caption("No analyzed messages yet. Run analyze_pending.py to analyze stored events.")
+    if summary["pipeline_status"] == "insufficient_history":
+        st.warning("All messages come from a very short time span, so PULSE cannot tell what is growing yet. Collect data over a longer period.")
+    elif summary["pipeline_status"] != "ok":
+        st.warning("There are not enough messages yet to find topics and measure growth. Collect more data first.")
 
-    vectors = summary["vectors"]
-    if vectors:
-        st.caption(f"Vector status: trends {vectors.get('trends')}, audience {vectors.get('audience')}, network {vectors.get('network')}.")
+    window = summary["window_hours"]
+    st.subheader("Topics to watch right now")
+    st.caption("Topics that are new or growing fastest. Open PULSE Signals in the sidebar for full evidence and an explanation.")
+    if not summary["highlights"]:
+        st.info("Nothing is taking off right now. No topic has grown enough to be flagged in the latest window.")
+    for position, item in enumerate(summary["highlights"]):
+        render_signal_highlight(item, position)
 
-    st.markdown("#### Processing Workers")
-    try:
-        workers = worker_summary(fetch_worker_status())
-    except Exception:
-        workers = None
-    if workers is None:
-        st.caption("Worker status could not be loaded.")
-    elif not workers:
-        st.caption("No processing worker has reported yet. Start one with: python workers/run_worker.py")
+    st.subheader("How fast is each topic changing?")
+    if summary["velocity"] and window:
+        st.caption(
+            f"Number of messages about each topic in the latest {window:g} hours, compared with the {window:g} hours before that."
+        )
+        top_value = max([row["current"] for row in summary["velocity"]] + [row["previous"] for row in summary["velocity"]] + [1])
+        table = pd.DataFrame(
+            {
+                "Topic": [row["title"] for row in summary["velocity"]],
+                "Status": [row["status_label"] for row in summary["velocity"]],
+                "Before": [row["previous"] for row in summary["velocity"]],
+                "Now": [row["current"] for row in summary["velocity"]],
+                "Change": [row["growth_text"] for row in summary["velocity"]],
+            }
+        )
+        st.dataframe(
+            table,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Topic": st.column_config.TextColumn("Topic", width="large"),
+                "Status": st.column_config.TextColumn("Status", width="medium"),
+                "Before": st.column_config.ProgressColumn(
+                    f"Messages before ({window:g}h)", min_value=0, max_value=top_value, format="%d"
+                ),
+                "Now": st.column_config.ProgressColumn(
+                    f"Messages now ({window:g}h)", min_value=0, max_value=top_value, format="%d"
+                ),
+                "Change": st.column_config.TextColumn("Change", width="small"),
+            },
+        )
     else:
-        for row in workers:
-            state = "running" if row["alive"] else "not reporting"
-            age = "never" if row["heartbeat_age_seconds"] is None else f"{row['heartbeat_age_seconds']}s ago"
-            lag = "unknown" if row["consumer_lag"] is None else row["consumer_lag"]
-            p95 = "n/a" if row["batch_seconds_p95"] is None else f"{row['batch_seconds_p95']}s"
-            st.caption(
-                f"{row['worker_id']}: {state} (last heartbeat {age}) · stored {row['stored']} · analyzed {row['analyzed']} · "
-                f"malformed {row['malformed']} · analysis failures {row['analysis_failures']} · lag {lag} · batch P95 {p95}"
-            )
+        st.caption("Not enough history to measure how topics are changing yet.")
+
+    st.subheader("How do people feel?")
+    overview = sentiment_overview(events)
+    if overview["analyzed_events"]:
+        shares = overview["shares"]
+        counts = overview["distribution"]
+        sentiment_cols = st.columns(3)
+        for column, label, icon, tone in zip(sentiment_cols, ("Positive", "Neutral", "Negative"), ("🟢", "⚪", "🔴"), ("pos", "neu", "neg")):
+            with column:
+                with st.container(border=True, key=f"mood_{tone}"):
+                    st.metric(f"{icon} {label}", f"{round(shares[label] * 100)}%")
+                    st.caption(f"{counts[label]:,} messages")
+        st.caption(f"Based on {overview['analyzed_events']:,} of {overview['total_events']:,} messages that have been checked for sentiment.")
+    else:
+        st.caption("No messages have been checked for sentiment yet. Run analyze_pending.py to check stored messages.")
+
+    render_system_status(summary)
+
+
+def vector_problem(status):
+    if status == "insufficient_history":
+        return "the collected messages cover too short a time span"
+    return "more collected messages are needed"
+
+
+def render_system_status(summary):
+    with st.expander("Is everything working? (System status)"):
+        st.markdown("**1. Analysis checks**")
+        st.caption("Each analysis needs enough collected messages to work. A warning here just means: collect more data.")
+        vectors = summary["vectors"] or {}
+        checks = (
+            ("Topic detection", "trends", "finds what people are talking about"),
+            ("Audience groups", "audience", "groups people by what they write"),
+            ("Network", "network", "finds communities and how topics spread between them"),
+        )
+        for name, key, meaning in checks:
+            status = vectors.get(key)
+            if status == "ok":
+                st.markdown(f"✅ **{name}**: ready ({meaning})")
+            else:
+                st.markdown(f"⚠️ **{name}**: not ready, {vector_problem(status)} ({meaning})")
+
+        st.markdown("**2. Background worker (optional)**")
+        st.caption(
+            "A worker is a small program that keeps collecting and analysing new messages by itself. "
+            "You can use this dashboard without it. Start it only if you want the data to update automatically."
+        )
+        try:
+            workers = worker_summary(fetch_worker_status())
+        except Exception:
+            workers = None
+        if workers is None:
+            st.markdown("⚠️ Worker status could not be loaded. Check the database connection.")
+        elif not workers:
+            st.markdown("⚪ **No worker is running.** To start one, open a new terminal and run:")
+            st.code("python workers/run_worker.py", language="bash")
+        else:
+            for row in workers:
+                if row["alive"]:
+                    waiting = "unknown" if row["consumer_lag"] is None else row["consumer_lag"]
+                    st.markdown(
+                        f"✅ **{row['worker_id']}** is running. Messages waiting in the queue: {waiting}. "
+                        f"Messages stored so far: {row['stored']}."
+                    )
+                else:
+                    st.markdown(f"⚠️ **{row['worker_id']}** has stopped reporting. Restart it with `python workers/run_worker.py`.")
+            with st.expander("Technical details"):
+                for row in workers:
+                    age = "never" if row["heartbeat_age_seconds"] is None else f"{row['heartbeat_age_seconds']}s ago"
+                    p95 = "n/a" if row["batch_seconds_p95"] is None else f"{row['batch_seconds_p95']}s"
+                    st.caption(
+                        f"{row['worker_id']}: last heartbeat {age} · analyzed {row['analyzed']} · malformed {row['malformed']} · "
+                        f"analysis failures {row['analysis_failures']} · batch P95 {p95}"
+                    )
 
 
 def render_sentiment_page():
-    st.markdown("#### Sentiment Analytics")
-    st.caption("Built from stored, analyzed messages across every platform. Emotion and sarcasm are only evaluated for English text.")
+    with st.container(key="hero"):
+        st.header("Sentiment")
+        st.caption("How people feel about everything PULSE has collected so far, across YouTube, Telegram and news.")
     try:
         events, _ = load_intelligence()
     except Exception as e:
@@ -1523,66 +1633,88 @@ def render_sentiment_page():
 
     overview = sentiment_overview(events)
     if not overview["analyzed_events"]:
-        st.info("No analyzed messages yet. Run analyze_pending.py to analyze stored events.")
+        st.info("No messages have been analyzed yet. Run python analyze_pending.py to check the stored messages.")
         return
 
-    metric1, metric2, metric3, metric4 = st.columns(4)
+    counts = overview["distribution"]
+    total = overview["analyzed_events"]
     shares = overview["shares"]
-    with metric1:
-        kpi_card("Positive", f"{round(shares['Positive'] * 100)}%", f"{overview['distribution']['Positive']:,} messages", "#3B6D11")
-    with metric2:
-        kpi_card("Neutral", f"{round(shares['Neutral'] * 100)}%", f"{overview['distribution']['Neutral']:,} messages", "#B4B2A9")
-    with metric3:
-        kpi_card("Negative", f"{round(shares['Negative'] * 100)}%", f"{overview['distribution']['Negative']:,} messages", "#A32D2D")
-    with metric4:
+    st.markdown(f"**{overall_headline(counts, total)}**")
+    st.caption(f"Based on {total:,} of {overview['total_events']:,} collected messages that have been analyzed.")
+
+    with st.expander("What do these terms mean?"):
+        st.markdown(
+            "- **Positive / Neutral / Negative**: every message is classified by PULSE's sentiment models.\n"
+            "- **Sarcasm flagged**: messages that look sarcastic, where the literal words may mean the opposite. This is an approximate check and only works for English.\n"
+            "- **Emotion**: the main feeling in a message, such as joy or anger. Also English only.\n"
+            "- **Language**: detected automatically, so it can be wrong for very short or mixed-language text such as Hinglish."
+        )
+
+    st.subheader("How do people feel overall?")
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        metric_card("Positive", f"{round(shares['Positive'] * 100)}%", f"{counts['Positive']:,} messages", "Messages that express a positive opinion or feeling.", "🟢", "green")
+    with kpi2:
+        metric_card("Neutral", f"{round(shares['Neutral'] * 100)}%", f"{counts['Neutral']:,} messages", "Messages that are factual, mixed or have no clear opinion.", "⚪", "grey")
+    with kpi3:
+        metric_card("Negative", f"{round(shares['Negative'] * 100)}%", f"{counts['Negative']:,} messages", "Messages that express a negative opinion or feeling.", "🔴", "red")
+    with kpi4:
         sarcasm = overview["sarcasm"]
         if sarcasm["evaluated"]:
-            kpi_card("Sarcasm Flagged", f"{round(sarcasm['share'] * 100)}%", f"of {sarcasm['evaluated']:,} English messages checked")
+            metric_card("Sarcasm flagged", f"{round(sarcasm['share'] * 100)}%", f"of {sarcasm['evaluated']:,} English messages", "Share of English messages that look sarcastic. This is an approximate check.", "🟣", "purple")
         else:
-            kpi_card("Sarcasm Flagged", "n/a", "no English messages checked")
+            metric_card("Sarcasm flagged", "n/a", "no English messages checked", "Sarcasm is only checked for English messages.", "🟣", "purple")
 
-    st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
-    st.markdown("#### Sentiment Over Time")
-    timeline = pd.DataFrame(overview["timeline"])
-    if len(timeline) >= 2:
-        timeline["bucket"] = pd.to_datetime(timeline["bucket"])
-        st.bar_chart(timeline.set_index("bucket")[["Positive", "Neutral", "Negative"]], color=SENTIMENT_COLORS)
-        st.caption(f"Messages per {overview['timeline_unit']}, split by sentiment.")
+    st.subheader("How has the mood changed over time?")
+    timeline_rows = overview["timeline"]
+    unit = overview["timeline_unit"]
+    if len(timeline_rows) >= 2:
+        days = None
+        range_label = "all collected data"
+        if unit == "day":
+            chosen = st.radio("Time range", list(TIMELINE_RANGES), index=1, horizontal=True, key="sentiment_range")
+            days = TIMELINE_RANGES[chosen]
+            range_label = chosen.lower() + " of data" if days else "all collected data"
+        rows, shown_unit = timeline_window(timeline_rows, unit, days)
+        if len(rows) >= 2:
+            frame = pd.DataFrame(rows)
+            frame["bucket"] = pd.to_datetime(frame["bucket"])
+            st.bar_chart(frame.set_index("bucket")[["Positive", "Neutral", "Negative"]], color=SENTIMENT_COLORS)
+            st.caption(f"Number of messages per {shown_unit}, split by mood. Showing {range_label}.")
+        else:
+            st.caption("This time range has only one time bucket of messages, so a timeline can't be drawn. Try a longer range.")
     else:
         st.caption("All analyzed messages fall into a single time bucket, so a timeline can't be drawn yet.")
 
-    left, right = st.columns(2)
-    with left:
-        st.markdown("#### Platform Comparison")
-        platform_rows = {
-            name: {label: round(values["shares"][label] * 100, 1) for label in ("Positive", "Neutral", "Negative")}
-            for name, values in overview["by_platform"].items()
-        }
-        st.bar_chart(pd.DataFrame(platform_rows).T, horizontal=True, color=SENTIMENT_COLORS)
-        st.caption("Share of each platform's analyzed messages, in percent. " + ", ".join(
-            f"{name}: {values['total']:,}" for name, values in overview["by_platform"].items()
-        ))
-    with right:
-        st.markdown("#### Language Comparison")
-        if overview["by_language"]:
-            language_rows = {
-                row["language"]: {label: round(row["shares"][label] * 100, 1) for label in ("Positive", "Neutral", "Negative")}
-                for row in overview["by_language"]
-            }
-            st.bar_chart(pd.DataFrame(language_rows).T, horizontal=True, color=SENTIMENT_COLORS)
-            st.caption("Languages with at least 5 analyzed messages, in percent. " + ", ".join(
-                f"{row['language']}: {row['total']:,}" for row in overview["by_language"]
-            ))
-        else:
-            st.caption("No language has enough analyzed messages for a comparison yet.")
+    st.subheader("How do the sources compare?")
+    st.caption("Share of positive, neutral and negative messages on each platform.")
+    platform_rows = [
+        {"name": PLATFORM_LABELS.get(name, str(name).title()), "total": values["total"], "counts": {label: values[label] for label in ("Positive", "Neutral", "Negative")}}
+        for name, values in overview["by_platform"].items()
+    ]
+    st.markdown(stacked_bars_html(platform_rows), unsafe_allow_html=True)
 
-    st.markdown("#### Emotions")
-    if overview["emotions"]:
-        emotion_frame = pd.DataFrame(overview["emotions"]).set_index("emotion")
-        st.bar_chart(emotion_frame, horizontal=True, color=["#5F5E5A"])
-        st.caption("Emotion is classified only for English messages.")
+    st.subheader("Does the mood differ by language?")
+    if overview["by_language"]:
+        st.caption("Languages with at least a few analyzed messages. Language is detected automatically and can be wrong for short or mixed-language text, so treat small groups with care.")
+        language_rows = [
+            {"name": language_name(row["language"]), "total": row["total"], "counts": {label: row[label] for label in ("Positive", "Neutral", "Negative")}}
+            for row in overview["by_language"]
+        ]
+        st.markdown(stacked_bars_html(language_rows), unsafe_allow_html=True)
     else:
-        st.caption("No emotion data stored. Run analyze_pending.py without skipping emotion to fill it in.")
+        st.caption("No language has enough analyzed messages for a comparison yet.")
+
+    st.subheader("What emotions do people show?")
+    if overview["emotions"]:
+        emotion_total = sum(row["count"] for row in overview["emotions"])
+        st.caption("The main feeling detected in each English message. Messages in other languages are not included here.")
+        st.markdown(
+            ranked_bars_html([(row["emotion"], row["count"]) for row in overview["emotions"]], emotion_total),
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("No emotion data stored yet. Run analyze_pending.py without skipping emotion to fill it in.")
 
 
 if page == "Command Center":
@@ -1591,7 +1723,7 @@ if page == "Command Center":
 if page == "Sentiment":
     render_sentiment_page()
 
-if page == "Live Search":
+def render_live_youtube_news():
     if "keyword_input" not in st.session_state:
         st.session_state["keyword_input"] = ""
 
@@ -1607,20 +1739,8 @@ if page == "Live Search":
 
     trending_topics = fetch_trending_topics()
     if trending_topics:
-        st.markdown("""
-        <div style="background:#fff;border-radius:14px;padding:20px 22px;border:0.5px solid #E5E2D9;box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-top:16px;">
-            <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
-                <div style="width:40px;height:40px;border-radius:10px;background:#EAF3DE;display:flex;align-items:center;justify-content:center;font-size:18px;">🔥</div>
-                <div>
-                    <div style="display:flex;align-items:center;gap:8px;">
-                        <span style="font-size:16px;font-weight:700;color:#2C2C2A;">Trending on YouTube</span>
-                        <span style="background:#EAF3DE;color:#3B6D11;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;letter-spacing:0.5px;">LIVE</span>
-                    </div>
-                    <p style="color:#888780;font-size:12px;margin:2px 0 0 0;">What's hot and popular right now</p>
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.subheader("Trending on YouTube right now")
+        st.caption("Click 'Analyze this' under any trending video to see how people feel about it.")
 
         card_cols = st.columns(len(trending_topics))
         for i, item in enumerate(trending_topics):
@@ -1663,7 +1783,7 @@ if page == "Live Search":
 
     st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
 
-    compare_mode = st.checkbox("Compare two keywords instead")
+    compare_mode = st.checkbox("Compare two topics side by side")
 
     if compare_mode:
         cc1, cc2, cc3 = st.columns([2, 2, 1])
@@ -1702,24 +1822,34 @@ if page == "Live Search":
     if compare_mode and "compare_results" in st.session_state:
         result_a, result_b = st.session_state["compare_results"]
         st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
+        st.subheader("Side-by-side mood")
+        st.markdown(
+            compare_summary_html(
+                result_a["keyword"], result_a["counts"], result_a["total"],
+                result_b["keyword"], result_b["counts"], result_b["total"],
+            ),
+            unsafe_allow_html=True,
+        )
+        st.subheader("Details for each topic")
         comp_col1, comp_col2 = st.columns(2)
         with comp_col1:
-            render_result(result_a, key_prefix="a")
+            render_result(result_a, key_prefix="a", show_summary=False)
         with comp_col2:
-            render_result(result_b, key_prefix="b")
+            render_result(result_b, key_prefix="b", show_summary=False)
 
     elif not compare_mode and "last_result" not in st.session_state:
-        st.info("Enter a keyword above and click Analyze to see live sentiment.")
+        st.info("Type a topic above, or click 'Analyze this' on a trending video, to see how people feel about it.")
 
-if page == "Telegram Search":
-    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
-
-    st.markdown("#### Search Telegram")
+def render_telegram_search():
+    st.caption("PULSE looks up public Telegram channels related to your topic and checks the mood of their recent messages.")
     tg_col1, tg_col2 = st.columns([4, 1])
     with tg_col1:
         telegram_keyword = st.text_input("Search Telegram", placeholder="e.g. cricket, news, finance...", label_visibility="collapsed", key="telegram_keyword_input")
     with tg_col2:
         telegram_search_clicked = st.button("Analyze", use_container_width=True, type="primary", key="telegram_analyze_btn")
+
+    if telegram_search_clicked and not telegram_keyword.strip():
+        st.warning("Enter a keyword first, then click Analyze.")
 
     if telegram_search_clicked and telegram_keyword.strip():
         with st.spinner(f"Searching Telegram for '{telegram_keyword}'..."):
@@ -1737,60 +1867,11 @@ if page == "Telegram Search":
         tcounts = tresult["counts"]
         ttotal = tresult["total"]
 
-        tpos = round(tcounts["Positive"] / ttotal * 100) if ttotal else 0
-        tneu = round(tcounts["Neutral"] / ttotal * 100) if ttotal else 0
-        tneg = round(tcounts["Negative"] / ttotal * 100) if ttotal else 0
-
-        t_radius = 58
-        t_circumference = 2 * 3.14159265 * t_radius
-
-        def t_donut_segment(percent, offset_percent):
-            length = t_circumference * percent / 100
-            dash = f"{length:.2f} {t_circumference - length:.2f}"
-            dashoffset = -(t_circumference * offset_percent / 100)
-            return dash, dashoffset
-
-        t_pos_dash, t_pos_offset = t_donut_segment(tpos, 0)
-        t_neu_dash, t_neu_offset = t_donut_segment(tneu, tpos)
-        t_neg_dash, t_neg_offset = t_donut_segment(tneg, tpos + tneu)
-
-        t_dominant_pct = max(tpos, tneu, tneg)
-        t_dominant_label = "positive" if tpos == t_dominant_pct else "negative" if tneg == t_dominant_pct else "neutral"
-        t_dominant_color = "#3B6D11" if t_dominant_label == "positive" else "#A32D2D" if t_dominant_label == "negative" else "#5F5E5A"
-
-        st.markdown(f"<p style='color:#5F5E5A;font-size:13px;margin:0 0 12px 0;'>{ttotal} messages across {len(tresult['channels'])} channels</p>", unsafe_allow_html=True)
-
-        st.markdown(f"""
-        <div style="background:#fff;border-radius:14px;padding:22px;border:0.5px solid #E5E2D9;box-shadow:0 1px 3px rgba(44,44,42,0.05);margin-bottom:16px;display:grid;grid-template-columns:180px 1fr;gap:24px;align-items:center;">
-            <div style="display:flex;justify-content:center;">
-                <svg width="140" height="140" viewBox="0 0 140 140">
-                    <circle cx="70" cy="70" r="{t_radius}" fill="none" stroke="#F0EEE8" stroke-width="16"/>
-                    <circle cx="70" cy="70" r="{t_radius}" fill="none" stroke="#639922" stroke-width="16" stroke-dasharray="{t_pos_dash}" stroke-dashoffset="{t_pos_offset}" transform="rotate(-90 70 70)"/>
-                    <circle cx="70" cy="70" r="{t_radius}" fill="none" stroke="#B4B2A9" stroke-width="16" stroke-dasharray="{t_neu_dash}" stroke-dashoffset="{t_neu_offset}" transform="rotate(-90 70 70)"/>
-                    <circle cx="70" cy="70" r="{t_radius}" fill="none" stroke="#E24B4A" stroke-width="16" stroke-dasharray="{t_neg_dash}" stroke-dashoffset="{t_neg_offset}" transform="rotate(-90 70 70)"/>
-                    <text x="70" y="65" text-anchor="middle" font-size="26" font-weight="700" fill="{t_dominant_color}">{t_dominant_pct}%</text>
-                    <text x="70" y="85" text-anchor="middle" font-size="11" fill="#5F5E5A">{t_dominant_label}</text>
-                </svg>
-            </div>
-            <div style="display:flex;flex-direction:column;justify-content:center;gap:10px;">
-                <div style="display:flex;align-items:center;gap:10px;">
-                    <span style="width:10px;height:10px;border-radius:50%;background:#639922;"></span>
-                    <span style="color:#2C2C2A;font-size:14px;flex:1;">Positive</span>
-                    <span style="font-weight:700;color:#3B6D11;">{tpos}%</span>
-                </div>
-                <div style="display:flex;align-items:center;gap:10px;">
-                    <span style="width:10px;height:10px;border-radius:50%;background:#B4B2A9;"></span>
-                    <span style="color:#2C2C2A;font-size:14px;flex:1;">Neutral</span>
-                    <span style="font-weight:700;color:#5F5E5A;">{tneu}%</span>
-                </div>
-                <div style="display:flex;align-items:center;gap:10px;">
-                    <span style="width:10px;height:10px;border-radius:50%;background:#E24B4A;"></span>
-                    <span style="color:#2C2C2A;font-size:14px;flex:1;">Negative</span>
-                    <span style="font-weight:700;color:#A32D2D;">{tneg}%</span>
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(f"<span class='keyword-pill'>{html.escape(telegram_keyword.strip())}</span>", unsafe_allow_html=True)
+        st.caption(f"{ttotal} messages across {len(tresult['channels'])} channels")
+        st.subheader("How do people feel?")
+        st.markdown(single_summary_html(tcounts, ttotal), unsafe_allow_html=True)
+        st.caption("Each message is classified as positive, neutral or negative by PULSE's sentiment models.")
 
         with st.expander("Show channels and sample messages"):
             for ch in tresult["channels"]:
@@ -1801,79 +1882,121 @@ if page == "Telegram Search":
                 st.markdown("---")
 
 
+if page == "Live Search":
+    with st.container(key="hero"):
+        st.header("Live Search")
+        st.caption("Pick a topic and PULSE checks how people feel about it right now.")
+        live_source = st.radio("Where should PULSE look?", ["YouTube & News", "Telegram"], horizontal=True, key="live_source")
+    if live_source == "YouTube & News":
+        render_live_youtube_news()
+    else:
+        render_telegram_search()
+
 if page == "Trends":
-    st.markdown("#### Topic Trends")
-    st.caption("Groups collected messages into topics and tracks how fast each topic is growing or fading, including how its sentiment changes")
+    with st.container(key="hero"):
+        st.header("Trends")
+        st.caption("See which conversations are growing, steady or fading, and how people feel about each one.")
+    with st.expander("How to read this page"):
+        st.markdown(
+            "- **Topic**: a group of messages that talk about the same thing. Its name is made from its most common words.\n"
+            "- **New**: almost nobody talked about it before, now people do.\n"
+            "- **Growing**: it already existed and is getting more messages.\n"
+            "- **Steady**: about the same attention as before.\n"
+            "- **Fading**: fewer messages than before.\n"
+            "- **Messages before / now**: how many messages the topic got in the earlier and the latest time block."
+        )
 
     trend_col1, trend_col2 = st.columns([4, 1])
     with trend_col1:
         trend_keyword = st.text_input(
             "Trend keyword",
-            placeholder="Optional: limit to one keyword, or leave empty to use all collected data",
+            placeholder="Optional: look at one keyword only, or leave empty to use everything collected",
             label_visibility="collapsed",
             key="trend_keyword_input"
         )
     with trend_col2:
-        trend_clicked = st.button("Detect Trends", use_container_width=True, type="primary", key="detect_trends_btn")
+        trend_clicked = st.button("Find trends", use_container_width=True, type="primary", key="detect_trends_btn")
 
     if trend_clicked:
-        with st.spinner("Detecting topics and measuring their growth..."):
+        with st.spinner("Grouping messages into topics and checking how each one changed..."):
             try:
                 trend_events = fetch_events(keyword=trend_keyword.strip() or None, limit=20000)
                 st.session_state["trend_results"] = detect_topic_trends(trend_events)
             except Exception as e:
                 st.session_state.pop("trend_results", None)
-                st.error(f"Couldn't detect topic trends: {e}")
+                st.error(f"Couldn't find trends: {e}")
 
     if "trend_results" in st.session_state:
         render_topic_trends(st.session_state["trend_results"])
+    else:
+        st.info("Press Find trends to see which topics are changing.")
 
 
 if page == "Audience":
-    st.markdown("#### Audience Intelligence & Segmentation")
-    st.caption("Observable audience segments built from what people write: topics, language, engagement and sentiment. No age or gender is inferred.")
+    with st.container(key="hero"):
+        st.header("Audience")
+        st.caption("See who is taking part in the conversation: the different groups, what they talk about, and how they feel.")
+    with st.expander("How to read this page"):
+        st.markdown(
+            "- **Group**: messages that use similar words, put together by PULSE. Each group is a kind of conversation.\n"
+            "- **Share of messages**: how much of everything collected belongs to that group.\n"
+            "- **How do they feel**: the split of positive, neutral and negative messages inside the group.\n"
+            "- **Languages and Where they write**: the main languages and platforms in that group.\n"
+            "- **Over time**: whether the group's share is growing, steady or shrinking."
+        )
 
     seg_col1, seg_col2 = st.columns([4, 1])
     with seg_col1:
         segment_keyword = st.text_input(
             "Segment keyword",
-            placeholder="Optional: limit to one keyword, or leave empty to use all collected data",
+            placeholder="Optional: look at one keyword only, or leave empty to use everything collected",
             label_visibility="collapsed",
             key="segment_keyword_input"
         )
     with seg_col2:
-        segment_clicked = st.button("Build Segments", use_container_width=True, type="primary", key="build_segments_btn")
+        segment_clicked = st.button("Find groups", use_container_width=True, type="primary", key="build_segments_btn")
 
     if segment_clicked:
-        with st.spinner("Grouping collected messages into audience segments..."):
+        with st.spinner("Grouping messages into audience groups..."):
             try:
                 segment_events = fetch_events(keyword=segment_keyword.strip() or None, limit=20000)
                 st.session_state["audience_result"] = build_audience_segments(segment_events)
             except Exception as e:
                 st.session_state.pop("audience_result", None)
-                st.error(f"Couldn't build audience segments: {e}")
+                st.error(f"Couldn't find audience groups: {e}")
 
     if "audience_result" in st.session_state:
         render_audience_segments(st.session_state["audience_result"])
+    else:
+        st.info("Press Find groups to see who is talking.")
 
 
 if page == "Network":
-    st.markdown("#### Link & Network Analysis")
-    st.caption("Maps participants and the channels or videos they post in, then finds communities, bridge nodes and how topics spread between communities")
+    with st.container(key="hero"):
+        st.header("Network")
+        st.caption("See how people and channels are connected, which communities they form, and how topics travel between them.")
+    with st.expander("How to read this page"):
+        st.markdown(
+            "- **Person or account**: someone who wrote a comment or message.\n"
+            "- **Channel or video**: the place where they wrote it.\n"
+            "- **Community**: people and channels that mostly interact with each other.\n"
+            "- **Connector**: someone active in more than one community, so ideas can pass through them.\n"
+            "- **How topics spread**: which communities picked up a topic, and how many hours later."
+        )
 
     network_col1, network_col2 = st.columns([4, 1])
     with network_col1:
         network_keyword = st.text_input(
             "Network keyword",
-            placeholder="Optional: limit to one keyword, or leave empty to use all collected data",
+            placeholder="Optional: look at one keyword only, or leave empty to use everything collected",
             label_visibility="collapsed",
             key="network_keyword_input"
         )
     with network_col2:
-        network_clicked = st.button("Build Network", use_container_width=True, type="primary", key="build_network_btn")
+        network_clicked = st.button("Map network", use_container_width=True, type="primary", key="build_network_btn")
 
     if network_clicked:
-        with st.spinner("Building the network and measuring how topics spread..."):
+        with st.spinner("Connecting people and channels and checking how topics spread..."):
             try:
                 network_events = fetch_events(keyword=network_keyword.strip() or None, limit=20000)
                 network_trends = detect_topic_trends(network_events)
@@ -1884,36 +2007,47 @@ if page == "Network":
             except Exception as e:
                 st.session_state.pop("network_result", None)
                 st.session_state.pop("network_graph_obj", None)
-                st.error(f"Couldn't build the network: {e}")
+                st.error(f"Couldn't map the network: {e}")
 
     if "network_result" in st.session_state:
         render_network_intelligence(st.session_state["network_result"], st.session_state["network_graph_obj"])
+    else:
+        st.info("Press Map network to see who is connected.")
 
 
 if page == "PULSE Signals":
-    st.markdown("#### PULSE Signals")
-    st.caption("Fuses trend, sentiment, audience and network evidence into explainable signals about conversations that are emerging or rising")
+    with st.container(key="hero"):
+        st.header("PULSE Signals")
+        st.caption("The most important findings in one place: new or growing conversations that several checks agree on.")
+    with st.expander("How to read this page"):
+        st.markdown(
+            "- **Signal**: a new or growing topic that PULSE thinks is worth your attention.\n"
+            "- **Priority**: High means several checks agree it matters. Medium means worth watching. Low means an early sign.\n"
+            "- **Checks**: growth of messages, how people feel, which audience group is talking, and how far it spread between communities.\n"
+            "- **Score and confidence**: rough guides for ranking. They are not probabilities.\n"
+            "- **Explain in simple words**: writes a short explanation from the evidence PULSE already found."
+        )
 
     signal_col1, signal_col2 = st.columns([4, 1])
     with signal_col1:
         signal_keyword = st.text_input(
             "Signal keyword",
-            placeholder="Optional: limit to one keyword, or leave empty to use all collected data",
+            placeholder="Optional: look at one keyword only, or leave empty to use everything collected",
             label_visibility="collapsed",
             key="signal_keyword_input"
         )
     with signal_col2:
-        signal_clicked = st.button("Detect Signals", use_container_width=True, type="primary", key="detect_signals_btn")
+        signal_clicked = st.button("Find signals", use_container_width=True, type="primary", key="detect_signals_btn")
 
     if signal_clicked:
-        with st.spinner("Running trend, audience and network analysis and fusing the evidence..."):
+        with st.spinner("Checking growth, mood, audience and spread, then combining the results..."):
             try:
                 signal_events = fetch_events(keyword=signal_keyword.strip() or None, limit=20000)
                 st.session_state["signal_result"] = run_pipeline(signal_events)
                 st.session_state.pop("signal_save_message", None)
             except Exception as e:
                 st.session_state.pop("signal_result", None)
-                st.error(f"Couldn't detect signals: {e}")
+                st.error(f"Couldn't find signals: {e}")
 
     if "signal_result" in st.session_state:
         current_signals = st.session_state["signal_result"]["signals"]
