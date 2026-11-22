@@ -28,7 +28,7 @@ This is a hackathon prototype built to explore streaming data, applied NLP and g
 | Fusion | Weighted fusion of the four vectors into a score, with transparent weights and a corroboration rule |
 | Signals | Emerging and Rising signals with priority, score breakdown and a confidence proxy |
 | Explanations | Optional Gemini explanation written only from the signal's detected evidence; numbers in the reply are checked against the evidence and the reply is rejected if they do not match |
-| Dashboard | Streamlit pages: Command Center, Sentiment, Audience, Trends, Network, PULSE Signals, plus the live YouTube/News and Telegram search pages |
+| Dashboard | Streamlit pages written in plain language with a consistent layout: Command Center, Live Search (YouTube & News and Telegram in one page), Sentiment, Trends, Audience, Network, PULSE Signals. Each page has a short "How to read this page" guide, equal-height summary cards and the technical method in an expander. Signals can be downloaded as CSV |
 | Auth | Firebase email/password and Streamlit Google sign-in |
 | Resilience | Retries for transient MongoDB errors, classified Gemini failures with model fallback, per-service startup guards, clear warnings for API key, quota and timeout problems |
 
@@ -104,6 +104,11 @@ cd PULSE
 python -m venv venv
 venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+```
+
+Streamlit 1.39 or newer is required (the pages use keyed containers). Keep your virtual environment folder (`venv`, `venv311`, ...) out of git; `.gitignore` covers `venv*/`.
+
+```
 ```
 
 ### 2. Kafka
@@ -220,10 +225,16 @@ Together with the worker this gives the path `collector -> Kafka -> worker -> se
 
 ## Using the dashboard
 
-1. Collect data on **Live Search (YouTube & News)** and **Telegram Search**.
+1. Collect data on **Live Search**. Choose **YouTube & News** or **Telegram** at the top of the page.
 2. Run `python analyze_pending.py` if the Sentiment page shows unanalyzed events.
-3. Open **Command Center** for totals, top signals, trend velocity and sentiment overview.
-4. Open **PULSE Signals**, press **Detect Signals**, then **Explain this signal** for a written explanation. **Save these signals** stores them in MongoDB.
+3. Open **Command Center** for totals, top signals, trend velocity and the system status.
+4. **Sentiment**: how people feel overall, over time, by platform and by language.
+5. **Trends**: press **Find trends** to see which topics are new, growing, steady or fading.
+6. **Audience**: press **Find groups** to see the groups of conversation, their mood, languages and platforms.
+7. **Network**: press **Map network** to see communities, connectors between them and how topics spread.
+8. **PULSE Signals**: press **Find signals**, then **Explain in simple words** for a written explanation. **Save these signals** stores them in MongoDB and **Download signals as CSV** exports them.
+
+Every page has a "How to read this page" box and a "How was this worked out?" box. Words like TF-IDF, PageRank or velocity are kept in those boxes, not in the main view.
 
 Signals need enough data spread over time. With too few messages, or messages from a very short span, the pages say so instead of producing weak results.
 
@@ -242,7 +253,10 @@ python tests/test_nlp_robustness.py
 python tests/test_security.py
 python tests/test_worker.py
 python tests/test_ingestion_sources.py
+python tests/test_ui_sentiment.py
 ```
+
+Most of them also run with `python -m pytest tests -q`. Two helper functions in `test_audience.py` and `test_network.py` take arguments and are meant to be run through their own script, not collected by pytest.
 
 The tests use synthetic data and stubbed models and do not need network access, API keys or model downloads. `python check_security.py` scans the project for hardcoded secrets and tracked sensitive files.
 
@@ -292,6 +306,7 @@ Kafka lag and worker throughput are reported by the processing worker itself (`c
 
 ```
 app.py                   Streamlit dashboard
+ui_sentiment.py          Donut, bar and summary HTML helpers used by the pages
 config/env.py            Environment variable helpers
 ingestion/sources.py     YouTube, news and Telegram collection functions
 ingestion/normalizer.py  Source-to-event normalization
@@ -305,7 +320,7 @@ intelligence/
   signals.py             PULSE Signal generation and pipeline
   explain.py             Evidence-grounded explanations
   gemini_client.py       Gemini client with retry and fallback
-  overview.py            Command Center and sentiment page data
+  overview.py            Plain-language page data for Command Center, Sentiment, Trends, Audience, Network and Signals
 storage/mongodb.py       MongoDB access with retry
 evaluation/              Labelling, metrics, benchmarks
 tests/                   Test suite
@@ -329,6 +344,7 @@ These files come from the first version of the project. The dashboard no longer 
 
 - **Sentiment accuracy is not yet reported.** The ensemble has not been scored on a labelled sample in this README. Emotion and sarcasm models are English-only, and the sentiment models are weaker on Hindi and Hinglish. Language detection cannot identify Hinglish written in Latin script.
 - **Confidence values are proxies**, not calibrated probabilities. This applies to both the sentiment `confidence_proxy` and the signal confidence.
+- **Page text describes what PULSE found, not what is true.** Plain wording such as "people are getting more negative" comes from model labels on the collected messages, so it inherits the sentiment limitations above.
 - **Fusion weights are not validated.** They are documented baseline choices.
 - **Audience and trend vectors are both text-based.** Segments and topics are built from similar word statistics, so audience concentration is only weak independent evidence for a trend.
 - **Audience segments are observable groups**, built from what people write. PULSE does not infer age, gender or other personal attributes.
@@ -343,7 +359,9 @@ These files come from the first version of the project. The dashboard no longer 
 ## Planned, not implemented
 
 - Splitting `app.py` into a `ui/` package
-- Validating fusion weights against labelled signals
+- Validating fusion weights against labelled signals (for example, checking whether topics flagged as Emerging kept growing in the next window)
+- A better approach for Hinglish text, evaluated on the labelled sample before it is claimed
+- Alerts when a high-priority signal appears
 
 ## Security
 
