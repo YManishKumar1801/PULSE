@@ -169,6 +169,9 @@ def build_signal(fused, meta, created_at):
         "why_it_matters": _why_it_matters(fused),
         "keywords": fused["keywords"],
         "sample_texts": fused["sample_texts"][:2],
+        "sample_platforms": fused.get("sample_platforms", [])[:2],
+        "duplicate_share": fused.get("duplicate_share", 0.0),
+        "platform_mix": fused.get("platform_mix", {}),
         "window_hours": window,
         "created_at": created_at,
     }

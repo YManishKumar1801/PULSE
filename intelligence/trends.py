@@ -1,3 +1,4 @@
+import re
 from collections import Counter
 from datetime import timedelta, timezone
 
@@ -158,6 +159,31 @@ def _topic_terms(weights, feature_names):
     return [term.replace("_", " ") for term in chosen]
 
 
+def _text_key(text):
+    return re.sub(r"\W+", " ", text.lower()).strip()[:80]
+
+
+def _distinct_samples(order, documents, limit):
+    chosen = []
+    seen = set()
+    for index in order:
+        key = _text_key(documents[index][1])
+        if key in seen:
+            continue
+        seen.add(key)
+        chosen.append(index)
+        if len(chosen) == limit:
+            break
+    return chosen
+
+
+def _duplicate_share(members, documents):
+    keys = [_text_key(documents[i][1]) for i in members]
+    if not keys:
+        return 0.0
+    return round(1 - len(set(keys)) / len(keys), 3)
+
+
 def _event_keywords(event):
     keywords = event.get("keywords")
     if keywords:
@@ -271,7 +297,7 @@ def detect_topic_trends(events, window_hours=None, n_topics=None):
             for keyword in _event_keywords(documents[i][0]):
                 keyword_counts[keyword] += 1
 
-        ranked = sorted(members, key=lambda i: weights[i][topic], reverse=True)[:SAMPLE_TEXTS]
+        ranked = _distinct_samples(sorted(members, key=lambda i: weights[i][topic], reverse=True), documents, SAMPLE_TEXTS)
 
         topics.append({
             "name": ", ".join(terms[:3]),
@@ -289,6 +315,8 @@ def detect_topic_trends(events, window_hours=None, n_topics=None):
             "sentiment": _sentiment_shift(current_events, previous_events),
             "keywords": [{"keyword": keyword, "count": count} for keyword, count in keyword_counts.most_common(3)],
             "sample_texts": [documents[i][1][:160] for i in ranked],
+            "sample_platforms": [documents[i][0].get("platform") for i in ranked],
+            "duplicate_share": _duplicate_share(members, documents),
             "event_ids": [documents[i][0]["event_id"] for i in members],
         })
 

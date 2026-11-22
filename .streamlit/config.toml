@@ -2,6 +2,9 @@
 base = "light"
 primaryColor = "#3B6D11"
 backgroundColor = "#FAF9F6"
-secondaryBackgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1EFE8"
 textColor = "#2C2C2A"
 font = "sans serif"
+
+[client]
+toolbarMode = "minimal"

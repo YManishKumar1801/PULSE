@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.39
 pandas
 google-api-python-client
 vaderSentiment
@@ -15,3 +15,5 @@ networkx
 pyvis
 langdetect
 scikit-learn
+numpy
+scipy

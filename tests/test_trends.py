@@ -187,10 +187,20 @@ def test_short_span_uses_half_split():
     print("short span ok")
 
 
+def test_distinct_samples_and_duplicates():
+    result = detect_topic_trends(make_events())
+    for topic in result["topics"]:
+        assert len(set(topic["sample_texts"])) == len(topic["sample_texts"])
+        assert len(topic["sample_platforms"]) == len(topic["sample_texts"])
+        assert 0.0 <= topic["duplicate_share"] <= 1.0
+    print("distinct samples ok")
+
+
 if __name__ == "__main__":
     test_classification_rules()
     test_topic_trends()
     test_auto_topic_count_and_no_analysis()
     test_insufficient_cases()
     test_short_span_uses_half_split()
+    test_distinct_samples_and_duplicates()
     print("all trend tests passed")
